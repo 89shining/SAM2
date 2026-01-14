@@ -1,33 +1,3 @@
-#!/usr/bin/env python
-# coding: utf-8
-
-# In[1]:
-
-
-# Copyright (c) Meta Platforms, Inc. and affiliates.
-
-
-# # Video segmentation with SAM 2
-
-# This notebook shows how to use SAM 2 for interactive segmentation in videos. It will cover the following:
-# 
-# - adding clicks (or box) on a frame to get and refine _masklets_ (spatio-temporal masks)
-# - propagating clicks (or box) to get _masklets_ throughout the video
-# - segmenting and tracking multiple objects at the same time
-# 
-# We use the terms _segment_ or _mask_ to refer to the model prediction for an object on a single frame, and _masklet_ to refer to the spatio-temporal masks across the entire video. 
-
-# <a target="_blank" href="https://colab.research.google.com/github/facebookresearch/sam2/blob/main/notebooks/video_predictor_example.ipynb">
-#   <img src="https://colab.research.google.com/assets/colab-badge.svg" alt="Open In Colab"/>
-# </a>
-
-# ## Environment Set-up
-
-# If running locally using jupyter, first install `sam2` in your environment using the [installation instructions](https://github.com/facebookresearch/sam2#installation) in the repository.
-# 
-# If running from Google Colab, set `using_colab=True` below and run the cell. In Colab, be sure to select 'GPU' under 'Edit'->'Notebook Settings'->'Hardware accelerator'. Note that it's recommended to use **A100 or L4 GPUs when running in Colab** (T4 GPUs might also work, but could be slow and might run out of memory in some cases).
-
-# In[2]:
 
 
 using_colab = False
@@ -95,11 +65,7 @@ elif device.type == "mps":
     )
 
 
-# ### Loading the SAM 2 video predictor
-
-# In[6]:
-
-
+# Loading the SAM 2 video predictor
 from sam2.build_sam import build_sam2_video_predictor
 
 sam2_checkpoint = "../checkpoints/sam2.1_hiera_large.pt"
@@ -107,10 +73,7 @@ model_cfg = "configs/sam2.1/sam2.1_hiera_l.yaml"
 
 predictor = build_sam2_video_predictor(model_cfg, sam2_checkpoint, device=device)
 
-
-# In[7]:
-
-
+# 可视化函数
 def show_mask(mask, ax, obj_id=None, random_color=False):
     if random_color:
         color = np.concatenate([np.random.random(3), np.array([0.6])], axis=0)
@@ -150,6 +113,8 @@ def show_box(box, ax):
 
 
 # `video_dir` a directory of JPEG frames with filenames like `<frame_index>.jpg`
+# 读取视频帧，帧名：0.jpg/1.jpg/2.jpg....  或 00000.jpg.....
+# 按数字大小排序
 video_dir = "./videos/bedroom"
 
 # scan all the JPEG frame names in this directory
@@ -172,9 +137,8 @@ plt.imshow(Image.open(os.path.join(video_dir, frame_names[frame_idx])))
 # 
 # During initialization, it loads all the JPEG frames in `video_path` and stores their pixels in `inference_state` (as shown in the progress bar below).
 
-# In[9]:
 
-
+# 初始化：读取所有帧，缓存进inference_state
 inference_state = predictor.init_state(video_path=video_dir)
 
 
@@ -183,10 +147,7 @@ inference_state = predictor.init_state(video_path=video_dir)
 # Note: if you have run any previous tracking using this `inference_state`, please reset it first via `reset_state`.
 # 
 # (The cell below is just for illustration; it's not needed to call `reset_state` here as this `inference_state` is just freshly initialized above.)
-
-# In[10]:
-
-
+# 重置状态（清空提示）
 predictor.reset_state(inference_state)
 
 
@@ -198,12 +159,12 @@ predictor.reset_state(inference_state)
 # 
 # Note: label `1` indicates a *positive click (to add a region)* while label `0` indicates a *negative click (to remove a region)*.
 
-# In[11]:
-
-
+# 交互帧定位
 ann_frame_idx = 0  # the frame index we interact with
+# 交互数
 ann_obj_id = 1  # give a unique id to each object we interact with (it can be any integers)
 
+# 点提示
 # Let's add a positive click at (x, y) = (210, 350) to get started
 points = np.array([[210, 350]], dtype=np.float32)
 # for labels, `1` means positive click and `0` means negative click
@@ -232,9 +193,7 @@ show_mask((out_mask_logits[0] > 0.0).cpu().numpy(), plt.gca(), obj_id=out_obj_id
 # 
 # Note: we need to send **all the clicks and their labels** (i.e. not just the last click) when calling `add_new_points_or_box`.
 
-# In[12]:
-
-
+# 第二次refinement
 ann_frame_idx = 0  # the frame index we interact with
 ann_obj_id = 1  # give a unique id to each object we interact with (it can be any integers)
 
@@ -265,9 +224,8 @@ show_mask((out_mask_logits[0] > 0.0).cpu().numpy(), plt.gca(), obj_id=out_obj_id
 
 # To get the masklet throughout the entire video, we propagate the prompts using the `propagate_in_video` API.
 
-# In[13]:
 
-
+# 将该对象传播至全视频
 # run propagation throughout the video and collect the results in a dict
 video_segments = {}  # video_segments contains the per-frame segmentation results
 for out_frame_idx, out_obj_ids, out_mask_logits in predictor.propagate_in_video(inference_state):
@@ -275,6 +233,7 @@ for out_frame_idx, out_obj_ids, out_mask_logits in predictor.propagate_in_video(
         out_obj_id: (out_mask_logits[i] > 0.0).cpu().numpy()
         for i, out_obj_id in enumerate(out_obj_ids)
     }
+
 
 # render the segmentation results every few frames
 vis_frame_stride = 30
@@ -295,7 +254,7 @@ for out_frame_idx in range(0, len(frame_names), vis_frame_stride):
 
 # In[14]:
 
-
+# 后续修正帧
 ann_frame_idx = 150  # further refine some details on this frame
 ann_obj_id = 1  # give a unique id to the object we interact with (it can be any integers)
 
@@ -357,9 +316,8 @@ for out_frame_idx in range(0, len(frame_names), vis_frame_stride):
 
 # Note: if you have run any previous tracking using this `inference_state`, please reset it first via `reset_state`.
 
-# In[16]:
 
-
+# box提示：重置
 predictor.reset_state(inference_state)
 
 
@@ -396,9 +354,8 @@ show_mask((out_mask_logits[0] > 0.0).cpu().numpy(), plt.gca(), obj_id=out_obj_id
 # 
 # Note: to refine the segmentation mask from a box prompt, we need to send **both the original box input and all subsequent refinement clicks and their labels** when calling `add_new_points_or_box`.
 
-# In[18]:
 
-
+# 第二轮+点修正
 ann_frame_idx = 0  # the frame index we interact with
 ann_obj_id = 4  # give a unique id to each object we interact with (it can be any integers)
 
@@ -459,7 +416,7 @@ for out_frame_idx in range(0, len(frame_names), vis_frame_stride):
 
 # In[20]:
 
-
+# 多对象
 predictor.reset_state(inference_state)
 
 
