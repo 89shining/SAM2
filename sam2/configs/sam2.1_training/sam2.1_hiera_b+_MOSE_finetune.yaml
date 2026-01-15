@@ -13,10 +13,10 @@ scratch:
 
 dataset:
   # PATHS to Dataset
-  img_folder: null # PATH to MOSE JPEGImages folder
-  gt_folder: null  # PATH to MOSE Annotations folder
-  file_list_txt: training/assets/MOSE_sample_train_list.txt # Optional PATH to filelist containing a subset of videos to be used for training
-  multiplier: 2
+  img_folder: /home/wusi/sam2/SAM2data/20260108/TrainData/JPEGImages # PATH to MOSE JPEGImages folder
+  gt_folder: /home/wusi/sam2/SAM2data/20260108/TrainData/Annotations  # PATH to MOSE Annotations folder
+  file_list_txt: /home/wusi/sam2/SAM2data/20260108/TrainData/ImageSets/train.txt # Optional PATH to filelist containing a subset of videos to be used for training
+  multiplier: 1
 
 # Video transforms
 vos:
@@ -323,8 +323,8 @@ trainer:
 
 launcher:
   num_nodes: 1
-  gpus_per_node: 8
-  experiment_log_dir: null # Path to log directory, defaults to ./sam2_logs/${config_name}
+  gpus_per_node: 2
+  experiment_log_dir: /home/wusi/sam2/SAM2data/20260108/TrainResult # Path to log directory, defaults to ./sam2_logs/${config_name}
 
 # SLURM args if running on a cluster
 submitit:
