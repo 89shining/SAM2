@@ -2,6 +2,7 @@
 对新增的每张切片每个指标
 按 stage(由K合并) 分组，在同一个横坐标下并排画多个指标的箱线图
 """
+import os
 
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -9,7 +10,7 @@ import matplotlib.pyplot as plt
 # =========================
 # 1. 读取数据
 # =========================
-xlsx_path = r"C:\Users\dell\Desktop\testdata\Prompt_incremental_analysis.xlsx"
+xlsx_path = r"C:\Users\WS\Desktop\Esophagus\AAPM投稿\Prompt_incremental_analysis.xlsx"
 df = pd.read_excel(xlsx_path, sheet_name="Incremental_All")
 
 # =========================
@@ -103,7 +104,8 @@ ax.tick_params(axis="x", which="minor", pad=2)
 
 plt.tight_layout()
 
-out_png = r"C:\Users\dell\Desktop\testdata\boxplot_grouped_merged_metrics.png"
+out_png = r"C:\Users\WS\Desktop\Esophagus\AAPM投稿\boxplot\boxplot_grouped_merged_metrics.png"
+os.makedirs(os.path.dirname(out_png), exist_ok=True)
 plt.savefig(out_png, dpi=300)
 plt.close()
 

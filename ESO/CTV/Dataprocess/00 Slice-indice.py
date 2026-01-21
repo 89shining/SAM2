@@ -191,8 +191,8 @@ def process_folder(
 
 # ========= 使用示例 =========
 if __name__ == "__main__":
-    nii_dir = r"C:\Users\dell\Desktop\Eso-CTV\TestResult\TestResult\labelsTs"
-    out_csv = r"C:\Users\dell\Desktop/testdata/slice_level_metrics.csv"
+    nii_dir = r"C:\Users\WS\Desktop\Esophagus\AAPM投稿\Dataset\labels"
+    out_csv = r"C:\Users\WS\Desktop\Esophagus\AAPM投稿\slice_level_metrics.csv"
 
     process_folder(nii_dir, out_csv)
 

@@ -2,6 +2,7 @@
 对新增的每张切片每个指标单独绘制箱式图：4张
 横坐标K：3-10
 """
+import os
 
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -9,7 +10,7 @@ import matplotlib.pyplot as plt
 # =========================
 # 1. 读取数据
 # =========================
-xlsx_path = r"C:\Users\dell\Desktop\testdata\Prompt_incremental_analysis.xlsx"
+xlsx_path = r"C:\Users\WS\Desktop\Esophagus\AAPM投稿\Prompt_incremental_analysis.xlsx"
 df = pd.read_excel(xlsx_path, sheet_name="Incremental_All")
 
 # 保证 K 是有序的
@@ -44,7 +45,8 @@ for metric, ylabel in metrics.items():
     plt.tight_layout()
 
     # 保存图片
-    out_png = f"boxplot_{metric}.png"
+    out_png = rf"C:\Users\WS\Desktop\Esophagus\AAPM投稿\boxplot\boxplot_{metric}.png"
+    os.makedirs(os.path.dirname(out_png), exist_ok=True)
     plt.savefig(out_png, dpi=300)
     plt.close()
 
