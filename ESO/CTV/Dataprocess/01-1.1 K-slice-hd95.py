@@ -1,10 +1,10 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
-计算不同切片部位和数目对精度的影响
+HD95 + Dice constrained Oracle builder
 
-Oracle builder:
-Generate patient-level oracle results for K=2..K_max.
+- K=2: 固定上下界
+- K>=3: 在 Dice 不明显下降的前提下，最小化 HD95（均排除提示层）
 
 Output:
 oracle_patient_level.csv
@@ -43,9 +43,13 @@ WINDOW_WIDTH  = 400
 K_MAX = 10
 OBJ_ID = 1
 
-OUT_CSV = "/home/wusi/sam2/SAM2data/20260108/Statistics/testdata/oracle_patient_level.csv"
+OUT_CSV = "/home/wusi/sam2/SAM2data/20260108/Statistics/testdata/oracle_patient_level_hd95_constrained.csv"
 
-ROUND_N = 2   # ✅ 保留两位小数
+ROUND_N = 2
+
+# ===== Oracle 约束参数 =====
+DICE_TOL = 0.98          # Dice 允许最多下降 2%
+HD95_INF = 1e6
 
 
 # ===================== 工具函数 =====================
@@ -145,58 +149,69 @@ def main():
         try:
             save_frames(img, tmp)
 
-            # ---------- K = 2 ----------
+            # ===== K = 2（仅上下界）=====
             prompt = [z_low, z_high]
             pred = sam2_infer(predictor, gt, prompt, tmp)
-
-            dice_all = round(dice_3d(pred, gt), ROUND_N)
-            dice_np  = round(dice_excl_prompt(pred, gt, prompt), ROUND_N)
-            hd_all   = round(hd95_3d(pred, gt, spacing), ROUND_N)
-            hd_np    = round(hd95_excl_prompt(pred, gt, prompt, spacing), ROUND_N)
-
-            best_mid = []
 
             results.append({
                 "PatientID": pid,
                 "K": 2,
-                "Dice3D_All": dice_all,
-                "Dice3D_NoPrompt": dice_np,
-                "HD95_All": hd_all,
-                "HD95_NoPrompt": hd_np,
+                "Dice3D_All": round(dice_3d(pred, gt), ROUND_N),
+                "Dice3D_NoPrompt": round(dice_excl_prompt(pred, gt, prompt), ROUND_N),
+                "HD95_All": round(hd95_3d(pred, gt, spacing), ROUND_N),
+                "HD95_NoPrompt": round(hd95_excl_prompt(pred, gt, prompt, spacing), ROUND_N),
                 "PromptSlices": str(prompt),
             })
 
-            # ---------- K >= 3 ----------
+            best_mid = []
+
+            # ===== K >= 3：HD95 + Dice 约束 Oracle =====
             for K in range(3, K_MAX + 1):
-                best = (-1, None)
+
+                best_hd = HD95_INF
+                best_dice = -1
+                best_z = None
 
                 for z in mid_candidates:
                     if z in best_mid:
                         continue
+
                     trial = [z_low, z_high] + best_mid + [z]
                     pred_tmp = sam2_infer(predictor, gt, trial, tmp)
-                    d = dice_excl_prompt(pred_tmp, gt, trial)
-                    if d > best[0]:
-                        best = (d, z)
 
-                if best[1] is not None:
-                    best_mid.append(best[1])
+                    d = dice_excl_prompt(pred_tmp, gt, trial)
+                    h = hd95_excl_prompt(pred_tmp, gt, trial, spacing)
+
+                    if not np.isfinite(h) or d <= 0:
+                        continue
+
+                    if best_z is None:
+                        best_hd = h
+                        best_dice = d
+                        best_z = z
+                        continue
+
+                    if d < best_dice * DICE_TOL:
+                        continue
+
+                    if h < best_hd:
+                        best_hd = h
+                        best_dice = d
+                        best_z = z
+
+                if best_z is not None:
+                    best_mid.append(best_z)
 
                 trial = [z_low, z_high] + best_mid
                 pred = sam2_infer(predictor, gt, trial, tmp)
 
-                dice_all = round(dice_3d(pred, gt), ROUND_N)
-                dice_np  = round(dice_excl_prompt(pred, gt, trial), ROUND_N)
-                hd_all   = round(hd95_3d(pred, gt, spacing), ROUND_N)
-                hd_np    = round(hd95_excl_prompt(pred, gt, trial, spacing), ROUND_N)
-
                 results.append({
                     "PatientID": pid,
                     "K": K,
-                    "Dice3D_All": dice_all,
-                    "Dice3D_NoPrompt": dice_np,
-                    "HD95_All": hd_all,
-                    "HD95_NoPrompt": hd_np,
+                    "Dice3D_All": round(dice_3d(pred, gt), ROUND_N),
+                    "Dice3D_NoPrompt": round(dice_excl_prompt(pred, gt, trial), ROUND_N),
+                    "HD95_All": round(hd95_3d(pred, gt, spacing), ROUND_N),
+                    "HD95_NoPrompt": round(hd95_excl_prompt(pred, gt, trial, spacing), ROUND_N),
                     "PromptSlices": str(trial),
                 })
 
@@ -206,7 +221,7 @@ def main():
     out_path = Path(OUT_CSV)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     pd.DataFrame(results).to_csv(out_path, index=False)
-    print(f"✔ Oracle results saved to {out_path}")
+    print(f"✔ HD95 + Dice constrained oracle results saved to {out_path}")
 
 
 if __name__ == "__main__":

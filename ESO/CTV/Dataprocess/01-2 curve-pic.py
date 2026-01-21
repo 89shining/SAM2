@@ -3,6 +3,7 @@
 """
 统计汇总成 Excel 表（Summary 为 均值±标准差）
 绘制 K-Dice / K-HD95 曲线（分开保存）
+PatientID 按数字顺序排序（修复 p_10 在 p_2 前的问题）
 """
 
 import pandas as pd
@@ -56,7 +57,17 @@ def main():
     if not required.issubset(df.columns):
         raise ValueError(f"Missing columns: {required - set(df.columns)}")
 
+    # ===== 强制类型 =====
     df["K"] = df["K"].astype(int)
+
+    # ===== 新增：从 PatientID 提取数字，用于排序 =====
+    # 例如 p_2 -> 2, p_10 -> 10
+    df["_pid_num"] = (
+        df["PatientID"]
+        .astype(str)
+        .str.extract(r"(\d+)")
+        .astype(int)
+    )
 
     # ==================================================
     # 1) Summary（均值±标准差）
@@ -101,8 +112,7 @@ def main():
 
         summary_rows.append(row)
 
-    df_summary = pd.DataFrame(summary_rows)
-    df_summary = df_summary[
+    df_summary = pd.DataFrame(summary_rows)[
         ["K", "Dice_All", "HD95_All", "Dice_NoPrompt", "HD95_NoPrompt"]
     ]
 
@@ -116,13 +126,14 @@ def main():
         # Summary
         df_summary.to_excel(writer, sheet_name="Summary", index=False)
 
-        # K2 ... K10
+        # K2 ... K10（按 PatientID 数值排序）
         for K in K_RANGE:
             df_k = df[df["K"] == K].copy()
             if len(df_k) == 0:
                 continue
 
-            df_k = df_k.sort_values("PatientID").reset_index(drop=True)
+            df_k = df_k.sort_values("_pid_num").reset_index(drop=True)
+            df_k = df_k.drop(columns="_pid_num")  # 不导出辅助列
             df_k.to_excel(writer, sheet_name=f"K{K}", index=False)
 
     print(f"[OK] Excel saved to: {OUT_XLSX}")
@@ -132,22 +143,13 @@ def main():
     # ==================================================
     ks = np.array(K_RANGE)
 
-    dice_all_mean = [
-        df[df["K"] == K]["Dice3D_All"].mean() for K in K_RANGE
-    ]
-    dice_all_std = [
-        df[df["K"] == K]["Dice3D_All"].std() for K in K_RANGE
-    ]
+    dice_all_mean = [df[df["K"] == K]["Dice3D_All"].mean() for K in K_RANGE]
+    dice_all_std  = [df[df["K"] == K]["Dice3D_All"].std()  for K in K_RANGE]
 
-    dice_np_mean = [
-        df[df["K"] == K]["Dice3D_NoPrompt"].mean() for K in K_RANGE
-    ]
-    dice_np_std = [
-        df[df["K"] == K]["Dice3D_NoPrompt"].std() for K in K_RANGE
-    ]
+    dice_np_mean = [df[df["K"] == K]["Dice3D_NoPrompt"].mean() for K in K_RANGE]
+    dice_np_std  = [df[df["K"] == K]["Dice3D_NoPrompt"].std()  for K in K_RANGE]
 
     plt.figure(figsize=(6.5, 4.5))
-
     plt.plot(ks, dice_all_mean, marker="o", linewidth=2, label="Dice3D_All")
     plt.fill_between(
         ks,
@@ -185,22 +187,13 @@ def main():
     # ==================================================
     # 4) 画 HD95 曲线
     # ==================================================
-    hd_all_mean = [
-        df[df["K"] == K]["HD95_All"].mean() for K in K_RANGE
-    ]
-    hd_all_std = [
-        df[df["K"] == K]["HD95_All"].std() for K in K_RANGE
-    ]
+    hd_all_mean = [df[df["K"] == K]["HD95_All"].mean() for K in K_RANGE]
+    hd_all_std  = [df[df["K"] == K]["HD95_All"].std()  for K in K_RANGE]
 
-    hd_np_mean = [
-        df[df["K"] == K]["HD95_NoPrompt"].mean() for K in K_RANGE
-    ]
-    hd_np_std = [
-        df[df["K"] == K]["HD95_NoPrompt"].std() for K in K_RANGE
-    ]
+    hd_np_mean = [df[df["K"] == K]["HD95_NoPrompt"].mean() for K in K_RANGE]
+    hd_np_std  = [df[df["K"] == K]["HD95_NoPrompt"].std()  for K in K_RANGE]
 
     plt.figure(figsize=(6.5, 4.5))
-
     plt.plot(ks, hd_all_mean, marker="o", linewidth=2, label="HD95_All")
     plt.fill_between(
         ks,
