@@ -16,11 +16,11 @@ from pathlib import Path
 # 配置区（只改这里）
 # ======================================================
 
-ORACLE_CSV = r"/home/wusi/sam2/SAM2data/20260108/Statistics/test-try/oracle_patient_level.csv"
-OUT_XLSX   = r"/home/wusi/sam2/SAM2data/20260108/Statistics/test-try/Oracle_Summary.xlsx"
+ORACLE_CSV = r"C:\Users\dell\Desktop\AAPM投稿\Uniform_Box\Uniform_Box_oracle_patient_level.csv"
+OUT_XLSX   = r"C:\Users\dell\Desktop\AAPM投稿\Uniform_Box\Uniform_Box_Oracle_Summary.xlsx"
 
-OUT_DICE_FIG = r"/home/wusi/sam2/SAM2data/20260108/Statistics/test-try/K_Dice.png"
-OUT_HD95_FIG = r"/home/wusi/sam2/SAM2data/20260108/Statistics/test-try/K_HD95.png"
+OUT_DICE_FIG = r"C:\Users\dell\Desktop\AAPM投稿\Uniform_Box\Uniform_Box_K_Dice.png"
+OUT_HD95_FIG = r"C:\Users\dell\Desktop\AAPM投稿\Uniform_Box\Uniform_Box_K_HD95.png"
 
 K_RANGE = list(range(2, 11))
 DECIMALS = 2

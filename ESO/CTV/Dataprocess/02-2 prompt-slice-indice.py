@@ -111,9 +111,9 @@ def merge_prompt_with_slice_level_to_excel(
 # =========================
 if __name__ == "__main__":
 
-    slice_level_csv = r"C:\Users\WS\Desktop\Esophagus\AAPM投稿\slice_level_metrics.csv"
-    prompt_csv = r"C:\Users\WS\Desktop\Esophagus\AAPM投稿\oracle_patient_level.csv"
-    out_excel = r"C:\Users\WS\Desktop\Esophagus\AAPM投稿\Prompt_slice_level_metrics.xlsx"
+    slice_level_csv = r"C:\Users\dell\Desktop\AAPM投稿\slice_level_metrics.csv"
+    prompt_csv = r"C:\Users\dell\Desktop\AAPM投稿\oracle_patient_level.csv"
+    out_excel = r"C:\Users\dell\Desktop\AAPM投稿\Prompt_slice_level_metrics.xlsx"
 
     merge_prompt_with_slice_level_to_excel(
         slice_level_csv=slice_level_csv,

@@ -9,10 +9,10 @@ import os
 # ======================
 # 路径配置
 # ======================
-slice_all_csv = r"C:\Users\WS\Desktop\Esophagus\AAPM投稿\slice_level_metrics.csv"
-prompt_xlsx   = r"C:\Users\WS\Desktop\Esophagus\AAPM投稿\Prompt_incremental_analysis.xlsx"
+slice_all_csv = r"C:\Users\dell\Desktop\AAPM投稿\slice_level_metrics.csv"
+prompt_xlsx   = r"C:\Users\dell\Desktop\AAPM投稿\Prompt_slice_level_metrics.xlsx"
 
-out_dir = r"C:\Users\WS\Desktop\Esophagus\AAPM投稿\SingleK"
+out_dir = r"C:\Users\dell\Desktop\AAPM投稿\AllK"
 os.makedirs(out_dir, exist_ok=True)
 
 # ======================

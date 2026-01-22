@@ -9,7 +9,7 @@ from scipy.stats import spearmanr
 # =========================
 # 1. 读取数据
 # =========================
-xlsx_path = r"C:\Users\WS\Desktop\Esophagus\AAPM投稿\Prompt_incremental_analysis.xlsx"
+xlsx_path = r"C:\Users\dell\Desktop\AAPM投稿\Prompt_incremental_analysis.xlsx"
 df = pd.read_excel(xlsx_path, sheet_name="Incremental_All")
 
 # =========================
