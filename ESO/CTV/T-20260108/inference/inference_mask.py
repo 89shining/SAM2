@@ -34,11 +34,11 @@ from sam2.build_sam import build_sam2_video_predictor
 # ======================================================
 
 DATA_ROOT = Path(
-    "/home/wusi/SAMdata/Eso/20260104_CTV/nnUNet_mask/cropdatanii/test_nii"
+    "/home/wusi/sam2/SAM2data/20260108/vis"
 )
 
 OUT_DIR = Path(
-    "/home/wusi/sam2/SAM2data/20260108/inference_mask/4s_mask"
+    "/home/wusi/sam2/SAM2data/20260108/Statistics/AAPM/visualize"
 )
 
 IMG_NAME = "image.nii.gz"
@@ -57,9 +57,9 @@ WINDOW_CENTER = 40
 WINDOW_WIDTH  = 400
 
 # prompt setting
-PROMPT_MODE  = "uniform"   # uniform / endpoints / custom
+PROMPT_MODE  = "custom"   # uniform / endpoints / custom
 NUM_PROMPTS  = 4
-CUSTOM_SLICES = ""         # e.g. "10,25,40" (only if PROMPT_MODE="custom")
+CUSTOM_SLICES = "0, 28, 17, 22, 5"         # e.g. "10,25,40" (only if PROMPT_MODE="custom")
 
 OBJ_ID = 1
 
