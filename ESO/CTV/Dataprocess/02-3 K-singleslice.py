@@ -8,7 +8,7 @@ import re
 # =========================
 # 1. 读取数据
 # =========================
-xlsx_path = r"C:\Users\dell\Desktop\AAPM投稿\Prompt_slice_level_metrics.xlsx"
+xlsx_path = r"C:\Users\WS\Desktop\Esophagus\AAPM投稿\Optimal_mask\Prompt_slice_level_metrics.xlsx"
 df = pd.read_excel(xlsx_path, sheet_name="All_Prompt")
 
 # =========================
@@ -65,7 +65,7 @@ df_incremental = df_incremental.sort_values(by=["patient_num", "K"])
 # =========================
 # 6. 保存为新的 Excel
 # =========================
-out_xlsx = r"C:\Users\dell\Desktop\AAPM投稿\Prompt_incremental_analysis.xlsx"
+out_xlsx = r"C:\Users\WS\Desktop\Esophagus\AAPM投稿\Optimal_mask\Prompt_add_single.xlsx"
 
 with pd.ExcelWriter(out_xlsx, engine="openpyxl") as writer:
     # Sheet 1：全部新增 slice
