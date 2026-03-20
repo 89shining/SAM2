@@ -2,7 +2,7 @@
 
 scratch:
   # ---------------- 训练数据 ----------------
-  train_root_dir: /home/wusi/SAMdata/Eso/20251217_CTV/datanii/train_nii
+  train_root_dir: /home/wusi/segment-anything/SAMdata/Eso/20251217_CTV/datanii/train_nii
   train_batch_size: 4
   num_train_workers: 2
 
@@ -43,7 +43,7 @@ scratch:
   save_best: true
 
 #   ---------------- 外部测试 ----------------
-#  test_root_dir: /home/wusi/SAMdata/Eso/20251217_CTV/datanii/test_nii  # 测试数据集
+#  test_root_dir: /home/wusi/segment-anything/SAMdata/Eso/20251217_CTV/datanii/test_nii  # 测试数据集
 #  test_batch_size: 1
 #  test_num_workers: 0
 #  test_ckpt_type: best
