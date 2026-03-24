@@ -6,7 +6,9 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 import os
 import csv
+import re
 import torch
+import torch.nn.functional as F
 import numpy as np
 import SimpleITK as sitk
 from tqdm import tqdm
@@ -36,15 +38,25 @@ def save_pred_nii(pred_arr, ref_img, save_path):
     pred_img.CopyInformation(ref_img)
     sitk.WriteImage(pred_img, str(save_path))
 
+def natural_sort_key(path_obj):
+    name = path_obj.name
+    return [int(x) if x.isdigit() else x.lower() for x in re.split(r"(\d+)", name)]
 
-# ---------------------- 测试数据集 ----------------------
+def patient_id_from_name(name):
+    match = re.search(r"\d+", name)
+    if match is None:
+        raise ValueError(f"Cannot extract numeric patient id from folder name: {name}")
+    return int(match.group())
+
+
+# ---------------------- 测试数据�?----------------------
 class TestDataset:
     def __init__(self, root_dir, image_name="image.nii.gz", mask_name="CTV.nii.gz", clip_len=8):
         self.root_dir = Path(root_dir)
         self.image_name = image_name
         self.mask_name = mask_name
         self.clip_len = clip_len
-        self.patients = sorted([p for p in self.root_dir.iterdir() if p.is_dir()])
+        self.patients = sorted([p for p in self.root_dir.iterdir() if p.is_dir()], key=natural_sort_key)
 
     def __len__(self):
         return len(self.patients)
@@ -102,7 +114,7 @@ def build_clip(img_zyx, mask_zyx, start, end, prompt_frame_idx_in_clip):
 
         obj = Object(
             object_id=1,
-            frame_index=local_t,   # 用 clip 内索引更稳妥
+            frame_index=local_t,   # �?clip 内索引更稳妥
             segment=mask_tensor
         )
         frame = Frame(data=image_tensor, objects=[obj])
@@ -117,7 +129,7 @@ def build_clip(img_zyx, mask_zyx, start, end, prompt_frame_idx_in_clip):
     return video
 
 
-# ---------------------- 测试主函数 ----------------------
+# ---------------------- 测试主函�?----------------------
 def test_model(
     test_root,
     ckpt_path,
@@ -129,14 +141,26 @@ def test_model(
     fusion_mode="max",   # "max" or "mean"
     threshold=0.0,
 ):
+    test_root = Path(test_root)
+    ckpt_path = Path(ckpt_path)
+    save_root = Path(save_root)
+    config_dir = Path(config_dir)
+
+    if not test_root.exists():
+        raise FileNotFoundError(f"test_root not found: {test_root}")
+    if not ckpt_path.exists():
+        raise FileNotFoundError(f"ckpt_path not found: {ckpt_path}")
+    if not config_dir.exists():
+        raise FileNotFoundError(f"config_dir not found: {config_dir}")
+
     device = torch.device(device if torch.cuda.is_available() else "cpu")
 
     # 1) 用和训练相同的配置实例化模型
-    with initialize_config_dir(config_dir=config_dir, version_base="1.2"):
+    with initialize_config_dir(config_dir=str(config_dir), version_base="1.2"):
         cfg = compose(config_name=config_name)
 
     model = instantiate(cfg.trainer.model, _convert_="all")
-    state_dict = torch.load(ckpt_path, map_location="cpu")["model"]
+    state_dict = torch.load(str(ckpt_path), map_location="cpu")["model"]
     missing, unexpected = model.load_state_dict(state_dict, strict=False)
     print(f"[Checkpoint] missing={len(missing)}, unexpected={len(unexpected)}")
 
@@ -145,7 +169,6 @@ def test_model(
 
     dataset = TestDataset(test_root, clip_len=clip_len)
 
-    save_root = Path(save_root)
     save_root.mkdir(parents=True, exist_ok=True)
 
     prompt_log_path = save_root / "prompt_layers_info.csv"
@@ -163,7 +186,7 @@ def test_model(
             writer.writerow([patient_name, data["prompt_layers"], len(data["prompt_layers"])])
 
             for s, e in data["clip_ranges"]:
-                # 找到落在当前 clip 内的绝对提示层
+                # 找到落在当前 clip 内的绝对提示�?
                 prompt_idx_abs = [p for p in data["prompt_layers"] if s <= p <= e]
 
                 if len(prompt_idx_abs) == 0:
@@ -186,8 +209,16 @@ def test_model(
                 with torch.no_grad():
                     out = model(batch)
 
-                    # out: 长度为 T 的 list；每个元素里 pred_masks_high_res 是 [B,1,H,W]
+                    # out: 长度�?T �?list；每个元素里 pred_masks_high_res �?[B,1,H,W]
                     pred_clip = torch.cat([frame_out["pred_masks_high_res"] for frame_out in out], dim=0)  # [T,1,H,W]
+                    target_hw = (img_zyx.shape[1], img_zyx.shape[2])
+                    if pred_clip.shape[-2:] != target_hw:
+                        pred_clip = F.interpolate(
+                            pred_clip,
+                            size=target_hw,
+                            mode="bilinear",
+                            align_corners=False,
+                        )
                     pred_clip = pred_clip[:, 0].cpu().numpy()  # [T,H,W]
 
                     # 二值化
@@ -205,9 +236,8 @@ def test_model(
                 merged_pred = merged_pred / np.maximum(count_map, 1)
 
             merged_pred = (merged_pred > 0.5).astype(np.uint8)
-
-            patient_idx = dataset.patients.index(data["patient_dir"])
-            save_path = save_root / f"CTV_{patient_idx:03d}.nii.gz"
+            patient_id = patient_id_from_name(patient_name)
+            save_path = save_root / f"CTV_{patient_id:03d}.nii.gz"
             save_pred_nii(merged_pred, data["img_sitk"], save_path)
 
     print(f"All patients done. Prompt layers info saved to {prompt_log_path}")
