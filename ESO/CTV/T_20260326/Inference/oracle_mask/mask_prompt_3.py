@@ -2,17 +2,15 @@
 # -*- coding: utf-8 -*-
 
 """
-SAM2 fixed-two-prompt inference on 3D NIfTI volumes (Z as video frames).
+SAM2 fixed-upper-lower + middle-search prompt inference on 3D NIfTI volumes.
 
 For each patient:
 1) find GT-positive slice bounds: lower and upper,
-2) run SAM2 video inference with exactly two GT-mask prompts (upper + lower),
-3) compute 3D Dice against GT,
-4) save records to Excel with the same table structure as prompt-layer search,
-5) save predicted mask as NIfTI.
-
-Note:
-- Best prompt layer related fields are intentionally left blank.
+2) fix two GT-mask prompts on upper + lower,
+3) enumerate middle GT-positive slices (excluding bounds) as the 3rd prompt,
+4) run SAM2 inference and compute 3D Dice for each middle-slice trial,
+5) save all trial records + best middle-slice summary to Excel,
+6) save only the best prediction mask as NIfTI.
 
 Prediction naming rule:
   p_10 -> CTV_010.nii.gz
@@ -42,14 +40,14 @@ from sam2.build_sam import build_sam2_video_predictor
 # ======================================================
 
 DATA_ROOT = Path("/home/wusi/SAM2/SAM2data/Eso/20260108/Data83")
-OUT_ROOT = Path("/home/wusi/SAM2/SAM2data/Eso/20260326/zero-shot/mask_prompt_2")
+OUT_ROOT = Path("/home/wusi/SAM2/SAM2data/Eso/20260326/zero-shot/oracle_mask/mask_prompt_3")
 BEST_MASK_DIR = OUT_ROOT / "best_mask"
-OUT_XLSX = OUT_ROOT / "prompt_layer_search.xlsx"
+OUT_XLSX = OUT_ROOT / "prompt_layer_search3.xlsx"
 
 IMG_NAME = "image.nii.gz"
 GT_NAME = "CTV.nii.gz"
 
-# Use the SAME yaml + pretrained checkpoint.
+# Keep the same yaml + checkpoint.
 SAM2_CKPT = Path("/home/wusi/SAM2/checkpoints/sam2.1_hiera_large.pt")
 SAM2_CFG = "configs/sam2.1/sam2.1_hiera_l.yaml"
 
@@ -113,17 +111,64 @@ def gt_positive_slices(gt_zyx):
     return [int(z) for z in non_empty.tolist()]
 
 
+def relative_pos_upper_to_lower(slice_id, lower_id, upper_id):
+    """
+    Relative position in [0,1] where:
+    - upper -> 0.0 (small)
+    - lower -> 1.0 (large)
+    """
+    if upper_id == lower_id:
+        return 0.0
+    return float((upper_id - slice_id) / (upper_id - lower_id))
+
+
 # ======================================================
 # =================== SAM2 Inference ====================
 # ======================================================
 
 
 @torch.no_grad()
-def infer_with_two_prompt_slices(predictor, frame_dir, gt_zyx, lower_id, upper_id):
+def infer_with_upper_lower_middle(predictor, frame_dir, gt_zyx, lower_id, upper_id, middle_id):
     state = predictor.init_state(video_path=str(frame_dir))
     predictor.reset_state(state)
 
-    # Add prompts on both bounds. If they are the same slice, add once.
+    prompt_ids = [int(upper_id)]
+    if int(lower_id) != int(upper_id):
+        prompt_ids.append(int(lower_id))
+    prompt_ids.append(int(middle_id))
+
+    # Keep order stable and avoid accidental duplicates.
+    prompt_ids = list(dict.fromkeys(prompt_ids))
+
+    for sid in prompt_ids:
+        prompt_mask = (gt_zyx[sid] > 0).astype(np.uint8)
+        if prompt_mask.sum() == 0:
+            raise RuntimeError(f"Prompt slice {sid} is empty in GT.")
+
+        predictor.add_new_mask(
+            inference_state=state,
+            frame_idx=sid,
+            obj_id=OBJ_ID,
+            mask=prompt_mask,
+        )
+
+    z, h, w = gt_zyx.shape
+    pred = np.zeros((z, h, w), dtype=np.uint8)
+
+    for fidx, obj_ids, logits in predictor.propagate_in_video(state):
+        for i, oid in enumerate(obj_ids):
+            if int(oid) == OBJ_ID:
+                pred[int(fidx)] = (logits[i] > 0).cpu().numpy()
+                break
+
+    return pred
+
+
+@torch.no_grad()
+def infer_with_upper_lower_only(predictor, frame_dir, gt_zyx, lower_id, upper_id):
+    state = predictor.init_state(video_path=str(frame_dir))
+    predictor.reset_state(state)
+
     prompt_ids = [int(upper_id)]
     if int(lower_id) != int(upper_id):
         prompt_ids.append(int(lower_id))
@@ -196,66 +241,121 @@ def main():
             print(f"[WARN] Skip {pdir.name}: shape mismatch img{img_zyx.shape} vs gt{gt_zyx.shape}")
             continue
 
-        candidate_slices = gt_positive_slices(gt_zyx)
-        if len(candidate_slices) == 0:
+        positive_slices = gt_positive_slices(gt_zyx)
+        if len(positive_slices) == 0:
             print(f"[WARN] Skip {pdir.name}: GT has no positive slices")
             continue
 
-        lower_id = int(min(candidate_slices))
-        upper_id = int(max(candidate_slices))
+        lower_id = int(min(positive_slices))
+        upper_id = int(max(positive_slices))
+
+        middle_candidates = [z for z in positive_slices if lower_id < z < upper_id]
 
         print(
-            f"[INFO] {pdir.name} ({patient_id}) | fixed prompts: upper={upper_id}, lower={lower_id}"
+            f"[INFO] {pdir.name} ({patient_id}) | upper={upper_id}, lower={lower_id}, "
+            f"middle_candidates={len(middle_candidates)}"
         )
+
+        best_dice = -1.0
+        best_middle = None
+        best_rel = None
+        best_pred = None
 
         tmp_dir = Path(tempfile.mkdtemp(prefix=f"sam2_{pdir.name}_"))
         try:
             save_frames_from_volume(img_zyx, tmp_dir)
 
-            pred = infer_with_two_prompt_slices(
-                predictor=predictor,
-                frame_dir=tmp_dir,
-                gt_zyx=gt_zyx,
-                lower_id=lower_id,
-                upper_id=upper_id,
-            )
-            dice = dice_3d(pred, gt_zyx)
+            if len(middle_candidates) == 0:
+                # Fallback: if no middle GT-positive layer exists, run fixed upper+lower only.
+                pred = infer_with_upper_lower_only(
+                    predictor=predictor,
+                    frame_dir=tmp_dir,
+                    gt_zyx=gt_zyx,
+                    lower_id=lower_id,
+                    upper_id=upper_id,
+                )
+                dice = dice_3d(pred, gt_zyx)
 
-            write_mask_like(pred, img_sitk, out_mask_path)
-            print(f"[OK] {patient_id}: dice={dice:.4f} -> {out_mask_path}")
+                all_rows.append(
+                    {
+                        "Patient_ID": patient_id,
+                        "Prompt_Slice_ID": None,
+                        "Lower_Bound_ID": lower_id,
+                        "Upper_Bound_ID": upper_id,
+                        "Prompt_Rel_Pos_UpperToLower": None,
+                        "Dice3D": dice,
+                    }
+                )
 
-            # Keep sheet schema unchanged.
-            all_rows.append(
-                {
-                    "Patient_ID": patient_id,
-                    "Prompt_Slice_ID": f"{upper_id},{lower_id}",
-                    "Lower_Bound_ID": lower_id,
-                    "Upper_Bound_ID": upper_id,
-                    "Prompt_Rel_Pos_UpperToLower": None,
-                    "Dice3D": dice,
-                }
+                best_dice = dice
+                best_middle = None
+                best_rel = None
+                best_pred = pred.copy()
+            else:
+                for mid in middle_candidates:
+                    pred = infer_with_upper_lower_middle(
+                        predictor=predictor,
+                        frame_dir=tmp_dir,
+                        gt_zyx=gt_zyx,
+                        lower_id=lower_id,
+                        upper_id=upper_id,
+                        middle_id=int(mid),
+                    )
+                    dice = dice_3d(pred, gt_zyx)
+                    rel = relative_pos_upper_to_lower(int(mid), lower_id, upper_id)
+
+                    all_rows.append(
+                        {
+                            "Patient_ID": patient_id,
+                            "Prompt_Slice_ID": int(mid),
+                            "Lower_Bound_ID": lower_id,
+                            "Upper_Bound_ID": upper_id,
+                            "Prompt_Rel_Pos_UpperToLower": rel,
+                            "Dice3D": dice,
+                        }
+                    )
+
+                    if (dice > best_dice) or (
+                        abs(dice - best_dice) <= 1e-12 and best_rel is not None and rel < best_rel
+                    ):
+                        best_dice = dice
+                        best_middle = int(mid)
+                        best_rel = rel
+                        best_pred = pred.copy()
+
+            if best_pred is None:
+                print(f"[WARN] No valid result for {patient_id}")
+                continue
+
+            write_mask_like(best_pred, img_sitk, out_mask_path)
+            print(
+                f"[OK] Best {patient_id}: middle={best_middle}, rel={best_rel}, "
+                f"dice={best_dice:.4f} -> {out_mask_path}"
             )
 
             best_rows.append(
                 {
                     "Patient_ID": patient_id,
-                    "Best_Prompt_Slice_ID": None,
+                    "Best_Prompt_Slice_ID": best_middle,
                     "Lower_Bound_ID": lower_id,
                     "Upper_Bound_ID": upper_id,
-                    "Best_Prompt_Rel_Pos_UpperToLower": None,
-                    "Best_Dice3D": dice,
+                    "Best_Prompt_Rel_Pos_UpperToLower": best_rel,
+                    "Best_Dice3D": best_dice,
                 }
             )
 
         finally:
             shutil.rmtree(tmp_dir, ignore_errors=True)
 
-    # Sort outputs by numeric patient id.
     def _pid_key(row):
         mm = re.search(r"(\d+)$", str(row["Patient_ID"]))
         return int(mm.group(1)) if mm else 10**9
 
-    all_rows.sort(key=_pid_key)
+    def _prompt_key(row):
+        v = row["Prompt_Slice_ID"]
+        return -1 if v is None else int(v)
+
+    all_rows.sort(key=lambda r: (_pid_key(r), _prompt_key(r)))
     best_rows.sort(key=_pid_key)
 
     wb = Workbook()
@@ -279,7 +379,7 @@ def main():
                 r["Prompt_Slice_ID"],
                 int(r["Lower_Bound_ID"]),
                 int(r["Upper_Bound_ID"]),
-                None,
+                None if r["Prompt_Rel_Pos_UpperToLower"] is None else round(float(r["Prompt_Rel_Pos_UpperToLower"]), 6),
                 round(float(r["Dice3D"]), 6),
             ]
         )
@@ -299,17 +399,17 @@ def main():
         ws_best.append(
             [
                 r["Patient_ID"],
-                None,
+                r["Best_Prompt_Slice_ID"],
                 int(r["Lower_Bound_ID"]),
                 int(r["Upper_Bound_ID"]),
-                None,
+                None if r["Best_Prompt_Rel_Pos_UpperToLower"] is None else round(float(r["Best_Prompt_Rel_Pos_UpperToLower"]), 6),
                 round(float(r["Best_Dice3D"]), 6),
             ]
         )
 
     wb.save(str(OUT_XLSX))
     print(f"[DONE] Excel saved: {OUT_XLSX}")
-    print(f"[DONE] Masks saved in: {BEST_MASK_DIR}")
+    print(f"[DONE] Best masks saved in: {BEST_MASK_DIR}")
 
 
 if __name__ == "__main__":
