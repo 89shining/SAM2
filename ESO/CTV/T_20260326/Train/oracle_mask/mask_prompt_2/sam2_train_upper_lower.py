@@ -1,0 +1,87 @@
+import torch
+
+from training.model.sam2 import SAM2Train
+
+
+class SAM2TrainUpperLowerMask(SAM2Train):
+    """
+    Train/eval with mask prompts only:
+    - For each object, automatically find GT-positive temporal bounds (lower/upper).
+    - Use GT masks on those two bound frames as conditioning prompts.
+    - Disable point/box prompts and iterative correction clicks.
+    """
+
+    def __init__(self, *args, **kwargs):
+        # Enforce mask-prompt-only behavior inside model definition.
+        kwargs.update(
+            dict(
+                prob_to_use_pt_input_for_train=0.0,
+                prob_to_use_pt_input_for_eval=0.0,
+                prob_to_use_box_input_for_train=0.0,
+                prob_to_use_box_input_for_eval=0.0,
+                prob_to_sample_from_gt_for_train=0.0,
+                num_frames_to_correct_for_train=1,
+                num_frames_to_correct_for_eval=1,
+                rand_frames_to_correct_for_train=False,
+                rand_frames_to_correct_for_eval=False,
+                add_all_frames_to_correct_as_cond=False,
+                num_correction_pt_per_frame=0,
+                rand_init_cond_frames_for_train=False,
+                rand_init_cond_frames_for_eval=False,
+            )
+        )
+        super().__init__(*args, **kwargs)
+
+    def prepare_prompt_inputs(self, backbone_out, input, start_frame_idx=0):
+        gt_masks_per_frame = {
+            frame_idx: masks.unsqueeze(1)
+            for frame_idx, masks in enumerate(input.masks)
+        }
+        num_frames = input.num_frames
+
+        backbone_out["gt_masks_per_frame"] = gt_masks_per_frame
+        backbone_out["num_frames"] = num_frames
+        backbone_out["use_pt_input"] = False
+        backbone_out["point_inputs_per_frame"] = {}
+        backbone_out["frames_to_add_correction_pt"] = []
+
+        # input.masks: [T, O, H, W]
+        masks_tohw = input.masks
+        if masks_tohw.ndim != 4:
+            raise ValueError(f"Expected input.masks to be [T, O, H, W], got {masks_tohw.shape}")
+
+        t_dim, o_dim = masks_tohw.shape[:2]
+        if t_dim != num_frames:
+            raise ValueError(f"num_frames mismatch: {num_frames} vs {t_dim}")
+
+        lower_ids = []
+        upper_ids = []
+        for obj_idx in range(o_dim):
+            per_t_has_fg = masks_tohw[:, obj_idx].flatten(1).any(dim=1)
+            pos_t = torch.nonzero(per_t_has_fg, as_tuple=False).flatten()
+            if pos_t.numel() == 0:
+                # Robust fallback for empty-object samples.
+                lower = start_frame_idx
+                upper = start_frame_idx
+            else:
+                lower = int(pos_t.min().item())
+                upper = int(pos_t.max().item())
+            lower_ids.append(lower)
+            upper_ids.append(upper)
+
+        init_cond_frames = sorted(set(lower_ids + upper_ids))
+        backbone_out["init_cond_frames"] = init_cond_frames
+        backbone_out["frames_not_in_init_cond"] = [
+            t for t in range(start_frame_idx, num_frames) if t not in init_cond_frames
+        ]
+
+        backbone_out["mask_inputs_per_frame"] = {}
+        for t in init_cond_frames:
+            gt_t = gt_masks_per_frame[t]  # [O, 1, H, W]
+            prompt_t = torch.zeros_like(gt_t)
+            for o in range(o_dim):
+                if lower_ids[o] == t or upper_ids[o] == t:
+                    prompt_t[o] = gt_t[o]
+            backbone_out["mask_inputs_per_frame"][t] = prompt_t
+
+        return backbone_out
