@@ -14,12 +14,17 @@ import SimpleITK as sitk
 import torch
 from openpyxl import Workbook
 from PIL import Image
+from medpy.metric.binary import hd95 as medpy_hd95
 
 # keep local import robust
 CURRENT_DIR = Path(__file__).resolve().parent
 
 
 def _find_project_root(start: Path) -> Path:
+    """
+    Find SAM2 repo root dynamically to avoid hard-coded parent depth.
+    Root must contain both `training` and `sam2` directories.
+    """
     for p in [start] + list(start.parents):
         if (p / "training").is_dir() and (p / "sam2").is_dir():
             return p
@@ -45,10 +50,10 @@ from sam2.build_sam import build_sam2_video_predictor
 
 # ================= Default Paths (edit here) =================
 DEFAULT_TEST_ROOT = Path("/home/wusi/SAM2/SAM2data/Eso/20260326/datanii/test_nii")
-DEFAULT_OUTPUT_ROOT = Path("/home/wusi/SAM2/SAM2data/Eso/20260326/Train/rule_mask/mask_prompt_3/two_epoch/TestResult")
+DEFAULT_OUTPUT_ROOT = Path("/home/wusi/SAM2/SAM2data/Eso/20260410/Train/mask_prompt_3/BadHD95_slice/TestResult")
 DEFAULT_MODEL_CFG = "configs/sam2.1/sam2.1_hiera_l.yaml"
-DEFAULT_FINETUNED_CKPT = Path("/home/wusi/SAM2/SAM2data/Eso/20260326/Train/rule_mask/mask_prompt_3/two_epoch/TrainResult/fold_0/checkpoints/best.pth")
-DEFAULT_TRAIN_OUTPUT_ROOT = Path("/home/wusi/SAM2/SAM2data/Eso/20260326/Train/rule_mask/mask_prompt_3/two_epoch/TrainResult")
+DEFAULT_FINETUNED_CKPT = Path("/home/wusi/SAM2/SAM2data/Eso/20260410/Train/mask_prompt_3/BadHD95_slice/TrainResult/fold_0/checkpoints/best.pth")
+DEFAULT_TRAIN_OUTPUT_ROOT = Path("/home/wusi/SAM2/SAM2data/Eso/20260326/20260410/Train/mask_prompt_3/BadHD95_slice/TrainResult")
 
 
 def window_to_uint8(img2d: np.ndarray, wc: float, ww: float) -> np.ndarray:
@@ -98,18 +103,42 @@ def gt_positive_slices(gt_zyx: np.ndarray):
     return [int(z) for z in non_empty.tolist()]
 
 
-def choose_middle_rule(middle_candidates):
-    # Same as Inference/rule_mask/mask_prompt_rule.py
-    if len(middle_candidates) == 0:
-        return None
-    cands = sorted(int(x) for x in middle_candidates)
-    return int(cands[len(cands) // 2])
-
-
-def relative_pos_upper_to_lower(slice_id: int, lower_id: int, upper_id: int):
+def relative_pos_upper_to_lower(slice_id: int, lower_id: int, upper_id: int) -> float:
     if upper_id == lower_id:
         return 0.0
     return float((upper_id - slice_id) / (upper_id - lower_id))
+
+
+def safe_hd95_2d(pred2d: np.ndarray, gt2d: np.ndarray) -> float:
+    pred2d = pred2d.astype(bool)
+    gt2d = gt2d.astype(bool)
+
+    if pred2d.sum() == 0 and gt2d.sum() == 0:
+        return -1.0
+    if pred2d.sum() == 0 or gt2d.sum() == 0:
+        return 1e6
+
+    try:
+        return float(medpy_hd95(pred2d, gt2d, voxelspacing=(1.0, 1.0)))
+    except Exception:
+        return 1e6
+
+
+def select_middle_from_first_pass_hd95(pred_zyx: np.ndarray, gt_zyx: np.ndarray, lower_id: int, upper_id: int) -> int:
+    candidate_slices = list(range(lower_id + 1, upper_id))
+    if len(candidate_slices) == 0:
+        return int(lower_id)
+
+    best_slice = candidate_slices[0]
+    worst_score = -1.0
+
+    for z in candidate_slices:
+        score = safe_hd95_2d(pred_zyx[z], gt_zyx[z])
+        if score > worst_score:
+            worst_score = score
+            best_slice = z
+
+    return int(best_slice)
 
 
 def _propagate_to_mask(state, predictor, gt_zyx: np.ndarray, obj_id: int) -> np.ndarray:
@@ -124,22 +153,22 @@ def _propagate_to_mask(state, predictor, gt_zyx: np.ndarray, obj_id: int) -> np.
 
 
 @torch.no_grad()
-def infer_with_iterative_three_prompt_slices(
+def infer_with_boundary_then_online_hd95_middle(
     predictor,
     frame_dir: Path,
     gt_zyx: np.ndarray,
     lower_id: int,
     upper_id: int,
-    middle_id: int,
     obj_id: int,
 ):
     state = predictor.init_state(video_path=str(frame_dir))
     predictor.reset_state(state)
 
-    # Stage-1: upper/lower prompts
+    # Pass-1: boundary only
     boundary_ids = [int(upper_id)]
     if int(lower_id) != int(upper_id):
         boundary_ids.append(int(lower_id))
+
     for sid in boundary_ids:
         prompt_mask = (gt_zyx[sid] > 0).astype(np.uint8)
         if prompt_mask.sum() == 0:
@@ -153,21 +182,27 @@ def infer_with_iterative_three_prompt_slices(
 
     pred_stage1 = _propagate_to_mask(state, predictor, gt_zyx, obj_id)
 
-    # Stage-2: add middle prompt on top of stage-1 state
-    mid = int(middle_id)
-    if mid not in boundary_ids:
-        mid_mask = (gt_zyx[mid] > 0).astype(np.uint8)
+    middle_id = select_middle_from_first_pass_hd95(
+        pred_zyx=pred_stage1,
+        gt_zyx=gt_zyx,
+        lower_id=lower_id,
+        upper_id=upper_id,
+    )
+
+    # Pass-2: add online-selected middle
+    if middle_id not in boundary_ids:
+        mid_mask = (gt_zyx[middle_id] > 0).astype(np.uint8)
         if mid_mask.sum() == 0:
-            raise RuntimeError(f"Prompt slice {mid} is empty in GT.")
+            raise RuntimeError(f"Prompt slice {middle_id} is empty in GT.")
         predictor.add_new_mask(
             inference_state=state,
-            frame_idx=mid,
+            frame_idx=middle_id,
             obj_id=obj_id,
             mask=mid_mask,
         )
 
     pred_stage2 = _propagate_to_mask(state, predictor, gt_zyx, obj_id)
-    return pred_stage1, pred_stage2
+    return pred_stage1, pred_stage2, middle_id
 
 
 def patient_id_from_folder(pdir: Path):
@@ -206,7 +241,7 @@ def resolve_ckpt(finetuned_ckpt: Path, train_output_root: Path) -> Path:
 
 
 def main():
-    parser = argparse.ArgumentParser("Test SAM2 with iterative upper/lower->rule-middle mask prompts")
+    parser = argparse.ArgumentParser("Test SAM2 with upper/lower -> online worst-HD95 middle prompts")
     parser.add_argument("--test-root", type=Path, default=DEFAULT_TEST_ROOT, help="Separate test set root")
     parser.add_argument("--output-root", type=Path, default=DEFAULT_OUTPUT_ROOT, help="Save root for masks/excel")
     parser.add_argument("--finetuned-ckpt", type=Path, default=DEFAULT_FINETUNED_CKPT, help="Checkpoint for inference")
@@ -218,7 +253,7 @@ def main():
     parser.add_argument("--window-center", type=float, default=40.0)
     parser.add_argument("--window-width", type=float, default=400.0)
     parser.add_argument("--device", type=str, default="cuda")
-    parser.add_argument("--excel-name", type=str, default="prompt_layer_search_rule_middle.xlsx")
+    parser.add_argument("--excel-name", type=str, default="online_hd95_middle_results.xlsx")
     args = parser.parse_args()
 
     if not args.test_root.exists():
@@ -270,34 +305,27 @@ def main():
 
         lower_id = int(min(pos))
         upper_id = int(max(pos))
-        middle_candidates = [z for z in pos if lower_id < z < upper_id]
-        middle_id = choose_middle_rule(middle_candidates)
-        if middle_id is None:
-            middle_id = lower_id
-
-        rel = relative_pos_upper_to_lower(middle_id, lower_id, upper_id)
-        print(
-            f"[INFO] {patient_id} | fixed prompts: upper={upper_id}, lower={lower_id}, middle={middle_id}"
-        )
 
         tmp_dir = Path(tempfile.mkdtemp(prefix=f"sam2_test_{pdir.name}_"))
         try:
             save_frames_from_volume(img_zyx, tmp_dir, args.window_center, args.window_width)
-            pred_stage1, pred_stage2 = infer_with_iterative_three_prompt_slices(
+            pred_stage1, pred_stage2, middle_id = infer_with_boundary_then_online_hd95_middle(
                 predictor=predictor,
                 frame_dir=tmp_dir,
                 gt_zyx=gt_zyx,
                 lower_id=lower_id,
                 upper_id=upper_id,
-                middle_id=middle_id,
                 obj_id=args.obj_id,
             )
             dice_stage1 = dice_3d(pred_stage1, gt_zyx)
             dice_stage2 = dice_3d(pred_stage2, gt_zyx)
+
+            rel = relative_pos_upper_to_lower(middle_id, lower_id, upper_id)
             write_mask_like(pred_stage2, img_sitk, out_mask_path)
+
             print(
                 f"[OK] {patient_id}: stage1_dice={dice_stage1:.4f}, "
-                f"stage2_dice={dice_stage2:.4f} -> {out_mask_path}"
+                f"stage2_dice={dice_stage2:.4f}, middle={middle_id} -> {out_mask_path}"
             )
 
             all_rows.append(
@@ -320,7 +348,6 @@ def main():
         return int(mm.group(1)) if mm else 10**9
 
     all_rows.sort(key=_pid_key)
-    
 
     wb = Workbook()
     ws_all = wb.active

@@ -18,7 +18,24 @@ from PIL import Image
 
 # keep local import robust
 CURRENT_DIR = Path(__file__).resolve().parent
-PROJECT_ROOT = Path(__file__).resolve().parents[7]
+
+
+def _find_project_root(start: Path) -> Path:
+    for p in [start] + list(start.parents):
+        if (p / "training").is_dir() and (p / "sam2").is_dir():
+            return p
+    env_root = os.environ.get("SAM2_PROJECT_ROOT", "").strip()
+    if env_root:
+        p = Path(env_root).resolve()
+        if (p / "training").is_dir() and (p / "sam2").is_dir():
+            return p
+    raise RuntimeError(
+        "Cannot locate SAM2 project root from script path. "
+        "Set SAM2_PROJECT_ROOT to a directory containing 'training' and 'sam2'."
+    )
+
+
+PROJECT_ROOT = _find_project_root(CURRENT_DIR)
 if str(CURRENT_DIR) not in sys.path:
     sys.path.insert(0, str(CURRENT_DIR))
 if str(PROJECT_ROOT) not in sys.path:
@@ -184,7 +201,7 @@ def infer_with_iterative_three_prompt_slices(
             mask=prompt_mask,
         )
 
-    _ = _propagate_to_mask(state, predictor, gt_zyx, obj_id)
+    pred_stage1 = _propagate_to_mask(state, predictor, gt_zyx, obj_id)
 
     # Stage-2: add middle prompt on top of stage-1 state
     mid = int(middle_id)
@@ -199,7 +216,8 @@ def infer_with_iterative_three_prompt_slices(
             mask=mid_mask,
         )
 
-    return _propagate_to_mask(state, predictor, gt_zyx, obj_id)
+    pred_stage2 = _propagate_to_mask(state, predictor, gt_zyx, obj_id)
+    return pred_stage1, pred_stage2
 
 
 def patient_id_from_folder(pdir: Path):
@@ -280,7 +298,6 @@ def main():
     print(f"[INFO] Found {len(patient_dirs)} patients")
 
     all_rows = []
-    best_rows = []
 
     for pdir in patient_dirs:
         patient_id = patient_id_from_folder(pdir)
@@ -334,7 +351,7 @@ def main():
         tmp_dir = Path(tempfile.mkdtemp(prefix=f"sam2_test_{pdir.name}_"))
         try:
             save_frames_from_volume(img_zyx, tmp_dir, args.window_center, args.window_width)
-            pred = infer_with_iterative_three_prompt_slices(
+            pred_stage1, pred_stage2 = infer_with_iterative_three_prompt_slices(
                 predictor=predictor,
                 frame_dir=tmp_dir,
                 gt_zyx=gt_zyx,
@@ -343,9 +360,13 @@ def main():
                 middle_id=middle_id,
                 obj_id=args.obj_id,
             )
-            dice = dice_3d(pred, gt_zyx)
-            write_mask_like(pred, img_sitk, out_mask_path)
-            print(f"[OK] {patient_id}: dice={dice:.4f} -> {out_mask_path}")
+            dice_stage1 = dice_3d(pred_stage1, gt_zyx)
+            dice_stage2 = dice_3d(pred_stage2, gt_zyx)
+            write_mask_like(pred_stage2, img_sitk, out_mask_path)
+            print(
+                f"[OK] {patient_id}: stage1_dice={dice_stage1:.4f}, "
+                f"stage2_dice={dice_stage2:.4f} -> {out_mask_path}"
+            )
 
             all_rows.append(
                 {
@@ -353,18 +374,10 @@ def main():
                     "Prompt_Slice_ID": f"{upper_id},{lower_id},{middle_id}",
                     "Lower_Bound_ID": lower_id,
                     "Upper_Bound_ID": upper_id,
+                    "Middle_ID": middle_id,
                     "Prompt_Rel_Pos_UpperToLower": rel,
-                    "Dice3D": dice,
-                }
-            )
-            best_rows.append(
-                {
-                    "Patient_ID": patient_id,
-                    "Best_Prompt_Slice_ID": middle_id,
-                    "Lower_Bound_ID": lower_id,
-                    "Upper_Bound_ID": upper_id,
-                    "Best_Prompt_Rel_Pos_UpperToLower": rel,
-                    "Best_Dice3D": dice,
+                    "Dice3D_stage1": dice_stage1,
+                    "Dice3D_stage2": dice_stage2,
                 }
             )
         finally:
@@ -375,19 +388,21 @@ def main():
         return int(mm.group(1)) if mm else 10**9
 
     all_rows.sort(key=_pid_key)
-    best_rows.sort(key=_pid_key)
+    
 
     wb = Workbook()
     ws_all = wb.active
-    ws_all.title = "All_Prompt_Search"
+    ws_all.title = "Results"
     ws_all.append(
         [
             "Patient_ID",
             "Prompt_Slice_ID",
             "Lower_Bound_ID",
             "Upper_Bound_ID",
+            "Middle_ID",
             "Prompt_Rel_Pos_UpperToLower",
-            "Dice3D",
+            "Dice3D_stage1",
+            "Dice3D_stage2",
         ]
     )
     for r in all_rows:
@@ -397,31 +412,10 @@ def main():
                 r["Prompt_Slice_ID"],
                 int(r["Lower_Bound_ID"]),
                 int(r["Upper_Bound_ID"]),
+                int(r["Middle_ID"]),
                 round(float(r["Prompt_Rel_Pos_UpperToLower"]), 6),
-                round(float(r["Dice3D"]), 6),
-            ]
-        )
-
-    ws_best = wb.create_sheet("Best_Per_Patient")
-    ws_best.append(
-        [
-            "Patient_ID",
-            "Best_Prompt_Slice_ID",
-            "Lower_Bound_ID",
-            "Upper_Bound_ID",
-            "Best_Prompt_Rel_Pos_UpperToLower",
-            "Best_Dice3D",
-        ]
-    )
-    for r in best_rows:
-        ws_best.append(
-            [
-                r["Patient_ID"],
-                int(r["Best_Prompt_Slice_ID"]),
-                int(r["Lower_Bound_ID"]),
-                int(r["Upper_Bound_ID"]),
-                round(float(r["Best_Prompt_Rel_Pos_UpperToLower"]), 6),
-                round(float(r["Best_Dice3D"]), 6),
+                round(float(r["Dice3D_stage1"]), 6),
+                round(float(r["Dice3D_stage2"]), 6),
             ]
         )
 

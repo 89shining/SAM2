@@ -1,11 +1,13 @@
 ﻿#!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
-SAM2 finetuning with 3 mask prompts:
-  upper + lower + middle(best from mask_prompt_3.xlsx)
+SAM2 finetuning with true two-pass prompting:
+  pass-1: upper + lower mask prompts only
+  select middle slice online from pass-1 prediction using worst 2D HD95
+  pass-2: upper + lower + selected middle mask prompt
 
 Example:
-CUDA_VISIBLE_DEVICES=0,1 torchrun --nproc_per_node=2 train_upper_lower_middle_cv_two_epoch.py
+CUDA_VISIBLE_DEVICES=0,1 torchrun --nproc_per_node=2 train_upper_lower_online_hd95_middle_cv.py
 """
 
 import argparse
@@ -18,7 +20,6 @@ import sys
 from pathlib import Path
 
 import numpy as np
-import pandas as pd
 import SimpleITK as sitk
 import torch
 import torch.nn.functional as F
@@ -30,12 +31,17 @@ from omegaconf import OmegaConf
 from torch.utils.data import DataLoader, Dataset
 from torch.utils.data.distributed import DistributedSampler
 from torch.nn.parallel import DistributedDataParallel as DDP
+from medpy.metric.binary import hd95 as medpy_hd95
 
 # ---- robust import path setup ----
 CURRENT_DIR = Path(__file__).resolve().parent
 
 
 def _find_project_root(start: Path) -> Path:
+    """
+    Find SAM2 repo root dynamically to avoid hard-coded parent depth.
+    Root must contain both `training` and `sam2` directories.
+    """
     for p in [start] + list(start.parents):
         if (p / "training").is_dir() and (p / "sam2").is_dir():
             return p
@@ -56,15 +62,14 @@ if str(CURRENT_DIR) not in sys.path:
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from sam2_train_upper_lower_middle import SAM2TrainUpperLowerMiddleMask
+from training.model.sam2 import SAM2Train
 from training.loss_fns import MultiStepMultiMasksAndIous
 from training.utils.data_utils import Frame, Object, VideoDatapoint, collate_fn
 
 
 # ================= Default Paths (edit here) =================
 DEFAULT_TRAIN_ROOT = Path("/home/wusi/SAM2/SAM2data/Eso/20260326/datanii/train_nii")
-DEFAULT_PROMPT3_XLSX = Path("/home/wusi/SAM2/SAM2data/Eso/20260326/zero-shot/oracle_mask/mask_prompt_3/prompt_layer_search3.xlsx")
-DEFAULT_OUTPUT_ROOT = Path("/home/wusi/SAM2/SAM2data/Eso/20260326/Train/oracle_mask/mask_prompt_3/two_epoch/TrainResult")
+DEFAULT_OUTPUT_ROOT = Path("/home/wusi/SAM2/SAM2data/Eso/20260410/Train/mask_prompt_3/BadHD95_slice/TrainResult")
 DEFAULT_MODEL_CFG = "configs/sam2.1/sam2.1_hiera_l.yaml"
 DEFAULT_PRETRAINED_CKPT = Path("/home/wusi/SAM2/checkpoints/sam2.1_hiera_large.pt")
 
@@ -90,23 +95,6 @@ def patient_sort_key(path_obj: Path):
     return [int(x) if x.isdigit() else x.lower() for x in parts]
 
 
-def normalize_id(value) -> str:
-    if pd.isna(value):
-        return ""
-    if isinstance(value, (int, np.integer)):
-        return str(int(value)).strip()
-    if isinstance(value, (float, np.floating)):
-        if float(value).is_integer():
-            return str(int(value)).strip()
-        return str(value).strip()
-    text = str(value).strip()
-    if text.endswith(".0"):
-        numeric = text[:-2]
-        if numeric.isdigit():
-            return numeric
-    return text
-
-
 def patient_id_from_folder(pdir: Path) -> str:
     m = re.search(r"(\d+)", pdir.name)
     if m is None:
@@ -121,85 +109,184 @@ def patient_video_num_from_id(patient_id: str) -> int:
     return int(m.group(1))
 
 
-def find_sheet_with_columns(excel_path: Path, required_columns):
-    if not excel_path.exists():
-        raise FileNotFoundError(f"Excel not found: {excel_path}")
-    sheets = pd.read_excel(excel_path, sheet_name=None)
-    for sheet_name, df in sheets.items():
-        if all(col in df.columns for col in required_columns):
-            print(f"[INFO] Using sheet '{sheet_name}' from {excel_path.name}")
-            return df.copy()
-    raise ValueError(
-        f"Cannot find required columns {list(required_columns)} in any sheet of {excel_path}"
-    )
-
-
-def load_middle_prompt_map(prompt3_xlsx: Path):
+class SAM2TrainUpperLowerDynamicMiddleMask(SAM2Train):
     """
-    Read middle prompt IDs from mask_prompt_3.py output excel.
-    Expected columns:
-      - Patient_ID
-      - Best_Prompt_Slice_ID
+    Two-pass training/eval:
+    - pass-1: boundary-only (upper + lower mask prompts)
+    - select middle frame online from pass-1 prediction
+    - pass-2: boundary + selected middle mask prompt
     """
-    df = find_sheet_with_columns(prompt3_xlsx, ["Patient_ID", "Best_Prompt_Slice_ID"])
-    df = df[["Patient_ID", "Best_Prompt_Slice_ID"]].copy()
-    df["Patient_ID"] = df["Patient_ID"].apply(normalize_id)
-    df["Best_Prompt_Slice_ID"] = df["Best_Prompt_Slice_ID"].apply(normalize_id)
 
-    df = df[(df["Patient_ID"] != "") & (df["Best_Prompt_Slice_ID"] != "")].copy()
-
-    prompt_map = {}
-    for _, row in df.iterrows():
-        pid = str(row["Patient_ID"])
-        try:
-            vid = patient_video_num_from_id(pid)
-            mid = int(float(row["Best_Prompt_Slice_ID"]))
-        except Exception as exc:
-            raise ValueError(f"Invalid row in prompt table: {row.to_dict()}") from exc
-
-        if vid in prompt_map and prompt_map[vid] != mid:
-            raise ValueError(
-                f"Duplicate Patient_ID with different middle slice: {pid} -> {prompt_map[vid]} vs {mid}"
+    def __init__(self, *args, **kwargs):
+        kwargs.update(
+            dict(
+                prob_to_use_pt_input_for_train=0.0,
+                prob_to_use_pt_input_for_eval=0.0,
+                prob_to_use_box_input_for_train=0.0,
+                prob_to_use_box_input_for_eval=0.0,
+                prob_to_sample_from_gt_for_train=0.0,
+                num_frames_to_correct_for_train=1,
+                num_frames_to_correct_for_eval=1,
+                rand_frames_to_correct_for_train=False,
+                rand_frames_to_correct_for_eval=False,
+                add_all_frames_to_correct_as_cond=False,
+                num_correction_pt_per_frame=0,
+                rand_init_cond_frames_for_train=False,
+                rand_init_cond_frames_for_eval=False,
             )
-        prompt_map[vid] = mid
+        )
+        super().__init__(*args, **kwargs)
+        self.runtime_middle_prompt_by_video_id = {}
+        self.enable_middle_prompt = False
 
-    if len(prompt_map) == 0:
-        raise ValueError(f"No valid middle prompt records loaded from: {prompt3_xlsx}")
+    def set_runtime_middle_prompt_map(self, mapping):
+        self.runtime_middle_prompt_by_video_id = {
+            int(k): int(v) for k, v in (mapping or {}).items()
+        }
+        self.enable_middle_prompt = len(self.runtime_middle_prompt_by_video_id) > 0
 
-    print(f"[INFO] Loaded middle prompt IDs for {len(prompt_map)} patients")
-    return prompt_map
+    def clear_runtime_middle_prompt_map(self):
+        self.runtime_middle_prompt_by_video_id = {}
+        self.enable_middle_prompt = False
+
+    @staticmethod
+    def _choose_fallback_middle(pos_t: torch.Tensor, lower: int, upper: int) -> int:
+        middle_candidates = [int(z) for z in pos_t.tolist() if lower < int(z) < upper]
+        if len(middle_candidates) == 0:
+            return lower
+        middle_candidates = sorted(middle_candidates)
+        return int(middle_candidates[len(middle_candidates) // 2])
+
+    @staticmethod
+    def _valid_mid_for_object(gt_obj_t_hw: torch.Tensor, mid: int, lower: int, upper: int) -> int:
+        t_dim = gt_obj_t_hw.shape[0]
+        mid = max(0, min(int(mid), t_dim - 1))
+        if bool(gt_obj_t_hw[mid].any()):
+            return mid
+        if bool(gt_obj_t_hw[lower].any()):
+            return int(lower)
+        if bool(gt_obj_t_hw[upper].any()):
+            return int(upper)
+        return int(mid)
+
+    def prepare_prompt_inputs(self, backbone_out, input, start_frame_idx=0):
+        gt_masks_per_frame = {
+            frame_idx: masks.unsqueeze(1)
+            for frame_idx, masks in enumerate(input.masks)
+        }
+        num_frames = input.num_frames
+
+        backbone_out["gt_masks_per_frame"] = gt_masks_per_frame
+        backbone_out["num_frames"] = num_frames
+        backbone_out["use_pt_input"] = False
+        backbone_out["point_inputs_per_frame"] = {}
+        backbone_out["frames_to_add_correction_pt"] = []
+
+        masks_tohw = input.masks  # [T, O, H, W]
+        if masks_tohw.ndim != 4:
+            raise ValueError(f"Expected input.masks to be [T, O, H, W], got {masks_tohw.shape}")
+
+        t_dim, o_dim = masks_tohw.shape[:2]
+        if t_dim != num_frames:
+            raise ValueError(f"num_frames mismatch: {num_frames} vs {t_dim}")
+
+        obj_video_ids = input.metadata.unique_objects_identifier[0, :, 0].to(torch.long)
+
+        lower_ids = []
+        upper_ids = []
+        middle_ids = []
+
+        for obj_idx in range(o_dim):
+            per_t_has_fg = masks_tohw[:, obj_idx].flatten(1).any(dim=1)
+            pos_t = torch.nonzero(per_t_has_fg, as_tuple=False).flatten()
+
+            if pos_t.numel() == 0:
+                lower = int(start_frame_idx)
+                upper = int(start_frame_idx)
+                middle = int(start_frame_idx)
+            else:
+                lower = int(pos_t.min().item())
+                upper = int(pos_t.max().item())
+
+                if self.enable_middle_prompt:
+                    video_id = int(obj_video_ids[obj_idx].item())
+                    external_mid = self.runtime_middle_prompt_by_video_id.get(video_id)
+                    if external_mid is None:
+                        external_mid = self._choose_fallback_middle(pos_t, lower, upper)
+                    middle = self._valid_mid_for_object(
+                        gt_obj_t_hw=masks_tohw[:, obj_idx],
+                        mid=int(external_mid),
+                        lower=lower,
+                        upper=upper,
+                    )
+                else:
+                    middle = None
+
+            lower_ids.append(lower)
+            upper_ids.append(upper)
+            middle_ids.append(middle)
+
+        init_cond_frames = sorted(set(lower_ids + upper_ids))
+
+        if self.enable_middle_prompt:
+            middle_prompt_frames = sorted(
+                set([m for m in middle_ids if m is not None]) - set(init_cond_frames)
+            )
+            remaining_frames = [
+                t for t in range(start_frame_idx, num_frames) if t not in init_cond_frames
+            ]
+            remaining_wo_middle = [t for t in remaining_frames if t not in middle_prompt_frames]
+            backbone_out["frames_not_in_init_cond"] = middle_prompt_frames + remaining_wo_middle
+        else:
+            backbone_out["frames_not_in_init_cond"] = [
+                t for t in range(start_frame_idx, num_frames) if t not in init_cond_frames
+            ]
+
+        backbone_out["init_cond_frames"] = init_cond_frames
+        backbone_out["mask_inputs_per_frame"] = {}
+
+        if self.enable_middle_prompt:
+            prompt_frames = sorted(set(init_cond_frames + [m for m in middle_ids if m is not None]))
+        else:
+            prompt_frames = init_cond_frames
+
+        for t in prompt_frames:
+            gt_t = gt_masks_per_frame[t]  # [O,1,H,W]
+            prompt_t = torch.zeros_like(gt_t)
+            for o in range(o_dim):
+                if lower_ids[o] == t or upper_ids[o] == t or (
+                    self.enable_middle_prompt and middle_ids[o] is not None and middle_ids[o] == t
+                ):
+                    prompt_t[o] = gt_t[o]
+            backbone_out["mask_inputs_per_frame"][t] = prompt_t
+
+        return backbone_out
 
 
-class UpperLowerMiddleVolumeDataset(Dataset):
+class UpperLowerVolumeDataset(Dataset):
     """
     Build full-volume videos from 3D NIfTI:
     - each item is one patient volume (no clip split)
     - one object (CTV) per frame
-    - middle prompt index is preloaded from prompt3 table and later consumed by model
     """
 
     def __init__(
         self,
         patient_dirs,
-        middle_prompt_by_video_id,
         image_name="image.nii.gz",
         mask_name="CTV.nii.gz",
         window_center=40.0,
         window_width=400.0,
         input_size=1024,
-        strict_middle=True,
     ):
         self.patient_dirs = list(patient_dirs)
-        self.middle_prompt_by_video_id = dict(middle_prompt_by_video_id)
         self.image_name = image_name
         self.mask_name = mask_name
         self.window_center = float(window_center)
         self.window_width = float(window_width)
         self.input_size = int(input_size)
-        self.strict_middle = bool(strict_middle)
 
         self.samples = []
-        missing_middle = []
 
         for pdir in self.patient_dirs:
             img_path = pdir / self.image_name
@@ -207,19 +294,14 @@ class UpperLowerMiddleVolumeDataset(Dataset):
             if not img_path.exists() or not gt_path.exists():
                 continue
 
-            patient_id = patient_id_from_folder(pdir)
-            video_id = patient_video_num_from_id(patient_id)
-
             gt = sitk.GetArrayFromImage(sitk.ReadImage(str(gt_path)))
             gt = (gt > 0).astype(np.uint8)
             pos = np.where(gt.sum(axis=(1, 2)) > 0)[0]
             if len(pos) == 0:
                 continue
 
-            if video_id not in self.middle_prompt_by_video_id:
-                missing_middle.append(patient_id)
-                if self.strict_middle:
-                    continue
+            patient_id = patient_id_from_folder(pdir)
+            video_id = patient_video_num_from_id(patient_id)
 
             self.samples.append(
                 {
@@ -227,13 +309,6 @@ class UpperLowerMiddleVolumeDataset(Dataset):
                     "patient_id": patient_id,
                     "video_id": video_id,
                 }
-            )
-
-        if self.strict_middle and len(missing_middle) > 0:
-            preview = ", ".join(missing_middle[:10])
-            raise ValueError(
-                f"Missing Best_Prompt_Slice_ID for {len(missing_middle)} train cases. "
-                f"Examples: {preview}. Please complete prompt table or use --allow-missing-middle"
             )
 
     def __len__(self):
@@ -292,7 +367,6 @@ def build_model(
     model_cfg_dict_template,
     pretrained_ckpt: Path,
     freeze_image_encoder: bool,
-    middle_prompt_by_video_id,
     device: torch.device,
 ):
     model_cfg_dict = dict(model_cfg_dict_template)
@@ -307,11 +381,10 @@ def build_model(
     memory_attention = instantiate(memory_attention_cfg, _recursive_=True)
     memory_encoder = instantiate(memory_encoder_cfg, _recursive_=True)
 
-    model = SAM2TrainUpperLowerMiddleMask(
+    model = SAM2TrainUpperLowerDynamicMiddleMask(
         image_encoder=image_encoder,
         memory_attention=memory_attention,
         memory_encoder=memory_encoder,
-        middle_prompt_by_video_id=middle_prompt_by_video_id,
         **model_cfg_dict,
     )
 
@@ -368,6 +441,71 @@ def compute_batch_volume_dice(outputs, batch_masks: torch.Tensor) -> float:
     return float(np.mean(dices)) if len(dices) else 0.0
 
 
+def _safe_hd95_2d(pred2d: np.ndarray, gt2d: np.ndarray) -> float:
+    pred2d = pred2d.astype(bool)
+    gt2d = gt2d.astype(bool)
+
+    if pred2d.sum() == 0 and gt2d.sum() == 0:
+        return -1.0  # skip
+    if pred2d.sum() == 0 or gt2d.sum() == 0:
+        return 1e6   # strongest penalty
+
+    try:
+        return float(medpy_hd95(pred2d, gt2d, voxelspacing=(1.0, 1.0)))
+    except Exception:
+        return 1e6
+
+
+def select_worst_hd95_middle_from_outputs(outputs, batch_masks: torch.Tensor, unique_objects_identifier):
+    """
+    outputs: list[T], each has pred_masks_high_res [O,1,H,W]
+    batch_masks: [T,O,H,W]
+    unique_objects_identifier: [T,O,3], where [...,0] is original video_id
+    """
+    t_dim, o_dim = batch_masks.shape[:2]
+    runtime_map = {}
+
+    pred_vols = []
+    for t in range(t_dim):
+        pred_t = (outputs[t]["pred_masks_high_res"][:, 0] > 0).detach().cpu().numpy().astype(np.uint8)
+        pred_vols.append(pred_t)
+    pred_vols = np.stack(pred_vols, axis=0)  # [T,O,H,W]
+
+    gt_vols = batch_masks.detach().cpu().numpy().astype(np.uint8)  # [T,O,H,W]
+
+    for o in range(o_dim):
+        video_id = int(unique_objects_identifier[0, o, 0].item())
+
+        gt_o = gt_vols[:, o]
+        pred_o = pred_vols[:, o]
+
+        pos = np.where(gt_o.reshape(t_dim, -1).any(axis=1))[0]
+        if len(pos) == 0:
+            runtime_map[video_id] = 0
+            continue
+
+        lower = int(pos.min())
+        upper = int(pos.max())
+
+        candidate_slices = [z for z in range(lower + 1, upper)]
+        if len(candidate_slices) == 0:
+            runtime_map[video_id] = lower
+            continue
+
+        best_slice = candidate_slices[0]
+        worst_score = -1.0
+
+        for z in candidate_slices:
+            score = _safe_hd95_2d(pred_o[z], gt_o[z])
+            if score > worst_score:
+                worst_score = score
+                best_slice = z
+
+        runtime_map[video_id] = int(best_slice)
+
+    return runtime_map
+
+
 def ddp_enabled() -> bool:
     return dist.is_available() and dist.is_initialized()
 
@@ -379,57 +517,6 @@ def reduce_scalar(value: float, device: torch.device) -> float:
     dist.all_reduce(t, op=dist.ReduceOp.SUM)
     t /= dist.get_world_size()
     return float(t.item())
-
-
-def run_epoch_two_pass(model, loader, loss_fn, optimizer, scaler, device, amp_dtype, train_mode: bool):
-    model.train(train_mode)
-    total_loss = 0.0
-    total_dice = 0.0
-    n_batch = 0
-
-    core_model = unwrap_model(model)
-
-    for batch in loader:
-        batch = batch.to(device, non_blocking=True)
-
-        # Pass-1: boundary prompts only
-        core_model.set_middle_prompt_enabled(False)
-        with torch.no_grad():
-            with torch.cuda.amp.autocast(
-                enabled=(device.type == "cuda"),
-                dtype=amp_dtype,
-            ):
-                _ = model(batch)
-
-        # Pass-2: boundary + fixed middle prompt (from prompt table)
-        core_model.set_middle_prompt_enabled(True)
-        with torch.cuda.amp.autocast(
-            enabled=(device.type == "cuda"),
-            dtype=amp_dtype,
-        ):
-            outputs_stage2 = model(batch)
-            loss_dict = loss_fn(outputs_stage2, batch.masks)
-            loss = loss_dict["core_loss"] if isinstance(loss_dict, dict) else loss_dict
-
-        if train_mode:
-            optimizer.zero_grad(set_to_none=True)
-            scaler.scale(loss).backward()
-            scaler.step(optimizer)
-            scaler.update()
-
-        total_loss += float(loss.item())
-        total_dice += compute_batch_volume_dice(outputs_stage2, batch.masks)
-        n_batch += 1
-
-        core_model.set_middle_prompt_enabled(False)
-
-    if n_batch == 0:
-        avg_loss, avg_dice = 0.0, 0.0
-    else:
-        avg_loss, avg_dice = total_loss / n_batch, total_dice / n_batch
-    avg_loss = reduce_scalar(avg_loss, device)
-    avg_dice = reduce_scalar(avg_dice, device)
-    return avg_loss, avg_dice
 
 
 def is_main_process() -> bool:
@@ -476,6 +563,70 @@ def load_ckpt(path: Path, model, optimizer=None, scheduler=None, scaler=None, ma
     return last_epoch, best_val_dice
 
 
+def run_epoch_two_pass(model, loader, loss_fn, optimizer, scaler, device, amp_dtype, train_mode: bool):
+    model.train(train_mode)
+    total_loss = 0.0
+    total_dice = 0.0
+    n_batch = 0
+
+    core_model = unwrap_model(model)
+
+    for batch in loader:
+        batch = batch.to(device, non_blocking=True)
+
+        # -------------------------
+        # Pass-1: boundary only
+        # -------------------------
+        core_model.clear_runtime_middle_prompt_map()
+
+        with torch.no_grad():
+            with torch.cuda.amp.autocast(
+                enabled=(device.type == "cuda"),
+                dtype=amp_dtype,
+            ):
+                outputs_stage1 = model(batch)
+
+        runtime_middle_map = select_worst_hd95_middle_from_outputs(
+            outputs=outputs_stage1,
+            batch_masks=batch.masks,
+            unique_objects_identifier=batch.metadata.unique_objects_identifier,
+        )
+
+        # -------------------------
+        # Pass-2: boundary + online-selected middle
+        # -------------------------
+        core_model.set_runtime_middle_prompt_map(runtime_middle_map)
+
+        with torch.cuda.amp.autocast(
+            enabled=(device.type == "cuda"),
+            dtype=amp_dtype,
+        ):
+            outputs_stage2 = model(batch)
+            loss_dict = loss_fn(outputs_stage2, batch.masks)
+            loss = loss_dict["core_loss"] if isinstance(loss_dict, dict) else loss_dict
+
+        if train_mode:
+            optimizer.zero_grad(set_to_none=True)
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+
+        total_loss += float(loss.item())
+        total_dice += compute_batch_volume_dice(outputs_stage2, batch.masks)
+        n_batch += 1
+
+        core_model.clear_runtime_middle_prompt_map()
+
+    if n_batch == 0:
+        avg_loss, avg_dice = 0.0, 0.0
+    else:
+        avg_loss, avg_dice = total_loss / n_batch, total_dice / n_batch
+
+    avg_loss = reduce_scalar(avg_loss, device)
+    avg_dice = reduce_scalar(avg_dice, device)
+    return avg_loss, avg_dice
+
+
 def make_folds(patient_dirs, num_folds: int, seed: int):
     patient_dirs = list(patient_dirs)
     rng = np.random.RandomState(seed)
@@ -492,9 +643,8 @@ def make_folds(patient_dirs, num_folds: int, seed: int):
 
 
 def main():
-    parser = argparse.ArgumentParser("SAM2 upper/lower->middle iterative-mask prompt finetuning")
+    parser = argparse.ArgumentParser("SAM2 upper/lower -> online worst-HD95 middle iterative mask finetuning")
     parser.add_argument("--train-root", type=Path, default=DEFAULT_TRAIN_ROOT, help="Directory containing train patient folders")
-    parser.add_argument("--prompt3-xlsx", type=Path, default=DEFAULT_PROMPT3_XLSX, help="mask_prompt_3.py output excel (contains Best_Prompt_Slice_ID)")
     parser.add_argument("--output-root", type=Path, default=DEFAULT_OUTPUT_ROOT, help="Output root for folds/checkpoints/logs")
     parser.add_argument(
         "--model-cfg",
@@ -524,7 +674,6 @@ def main():
     parser.add_argument("--eta-min-factor", type=float, default=0.1)
     parser.add_argument("--freeze-image-encoder", action="store_true", default=True)
     parser.add_argument("--no-freeze-image-encoder", dest="freeze_image_encoder", action="store_false")
-    parser.add_argument("--allow-missing-middle", action="store_true", help="Allow cases missing Best_Prompt_Slice_ID and fallback in model")
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--amp-dtype", type=str, default="bfloat16", choices=["bfloat16", "float16"])
     parser.add_argument(
@@ -541,8 +690,7 @@ def main():
     args = parser.parse_args()
 
     # Full-case training uses variable number of frames across patients.
-    # training.utils.data_utils.collate_fn requires equal T within one batch.
-    # Therefore batch size must be 1 unless we implement temporal padding.
+    # collate_fn requires equal T within one batch. Therefore batch size must be 1.
     if args.batch_size != 1:
         print(
             f"[WARN] batch_size={args.batch_size} is not supported for full-case variable-length videos. "
@@ -570,8 +718,6 @@ def main():
     else:
         device = torch.device(args.device if (args.device == "cpu" or torch.cuda.is_available()) else "cpu")
     amp_dtype = torch.bfloat16 if args.amp_dtype == "bfloat16" else torch.float16
-
-    middle_prompt_by_video_id = load_middle_prompt_map(args.prompt3_xlsx)
 
     patient_dirs = sorted([p for p in args.train_root.iterdir() if p.is_dir()], key=patient_sort_key)
     if len(patient_dirs) < args.num_folds:
@@ -608,25 +754,21 @@ def main():
             ckpt_dir.mkdir(parents=True, exist_ok=True)
             log_dir.mkdir(parents=True, exist_ok=True)
 
-        train_ds = UpperLowerMiddleVolumeDataset(
+        train_ds = UpperLowerVolumeDataset(
             train_patients,
-            middle_prompt_by_video_id=middle_prompt_by_video_id,
             image_name=args.image_name,
             mask_name=args.mask_name,
             window_center=args.window_center,
             window_width=args.window_width,
             input_size=args.input_size,
-            strict_middle=(not args.allow_missing_middle),
         )
-        val_ds = UpperLowerMiddleVolumeDataset(
+        val_ds = UpperLowerVolumeDataset(
             val_patients,
-            middle_prompt_by_video_id=middle_prompt_by_video_id,
             image_name=args.image_name,
             mask_name=args.mask_name,
             window_center=args.window_center,
             window_width=args.window_width,
             input_size=args.input_size,
-            strict_middle=(not args.allow_missing_middle),
         )
 
         train_sampler = DistributedSampler(train_ds, shuffle=True) if use_ddp else None
@@ -657,7 +799,6 @@ def main():
             model_cfg_dict_template=model_cfg_dict_template,
             pretrained_ckpt=args.pretrained_ckpt,
             freeze_image_encoder=args.freeze_image_encoder,
-            middle_prompt_by_video_id=middle_prompt_by_video_id,
             device=device,
         )
         if use_ddp:
@@ -685,6 +826,7 @@ def main():
         best_epoch = -1
         history = []
         start_epoch = 0
+
         if args.resume and (resume_fold_set is None or fold_idx in resume_fold_set):
             resume_ckpt = ckpt_dir / "last.pth"
             if resume_ckpt.exists():
@@ -724,6 +866,7 @@ def main():
         for epoch in range(start_epoch, args.epochs):
             if train_sampler is not None:
                 train_sampler.set_epoch(epoch)
+
             tr_loss, tr_dice = run_epoch_two_pass(
                 model=model,
                 loader=train_loader,
@@ -734,6 +877,7 @@ def main():
                 amp_dtype=amp_dtype,
                 train_mode=True,
             )
+
             with torch.no_grad():
                 va_loss, va_dice = run_epoch_two_pass(
                     model=model,
@@ -745,6 +889,7 @@ def main():
                     amp_dtype=amp_dtype,
                     train_mode=False,
                 )
+
             scheduler.step(va_dice)
 
             history.append(

@@ -32,7 +32,24 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 
 # ---- robust import path setup ----
 CURRENT_DIR = Path(__file__).resolve().parent
-PROJECT_ROOT = Path(__file__).resolve().parents[7]  # .../SAM2
+
+
+def _find_project_root(start: Path) -> Path:
+    for p in [start] + list(start.parents):
+        if (p / "training").is_dir() and (p / "sam2").is_dir():
+            return p
+    env_root = os.environ.get("SAM2_PROJECT_ROOT", "").strip()
+    if env_root:
+        p = Path(env_root).resolve()
+        if (p / "training").is_dir() and (p / "sam2").is_dir():
+            return p
+    raise RuntimeError(
+        "Cannot locate SAM2 project root from script path. "
+        "Set SAM2_PROJECT_ROOT to a directory containing 'training' and 'sam2'."
+    )
+
+
+PROJECT_ROOT = _find_project_root(CURRENT_DIR)
 if str(CURRENT_DIR) not in sys.path:
     sys.path.insert(0, str(CURRENT_DIR))
 if str(PROJECT_ROOT) not in sys.path:
@@ -252,20 +269,34 @@ def reduce_scalar(value: float, device: torch.device) -> float:
     return float(t.item())
 
 
-def run_epoch(model, loader, loss_fn, optimizer, scaler, device, amp_dtype, train_mode: bool):
+def run_epoch_two_pass(model, loader, loss_fn, optimizer, scaler, device, amp_dtype, train_mode: bool):
     model.train(train_mode)
     total_loss = 0.0
     total_dice = 0.0
     n_batch = 0
 
+    core_model = unwrap_model(model)
+
     for batch in loader:
         batch = batch.to(device, non_blocking=True)
+
+        # Pass-1: boundary prompts only
+        core_model.set_middle_prompt_enabled(False)
+        with torch.no_grad():
+            with torch.cuda.amp.autocast(
+                enabled=(device.type == "cuda"),
+                dtype=amp_dtype,
+            ):
+                _ = model(batch)
+
+        # Pass-2: boundary + rule-middle prompt
+        core_model.set_middle_prompt_enabled(True)
         with torch.cuda.amp.autocast(
             enabled=(device.type == "cuda"),
             dtype=amp_dtype,
         ):
-            outputs = model(batch)
-            loss_dict = loss_fn(outputs, batch.masks)
+            outputs_stage2 = model(batch)
+            loss_dict = loss_fn(outputs_stage2, batch.masks)
             loss = loss_dict["core_loss"] if isinstance(loss_dict, dict) else loss_dict
 
         if train_mode:
@@ -275,8 +306,10 @@ def run_epoch(model, loader, loss_fn, optimizer, scaler, device, amp_dtype, trai
             scaler.update()
 
         total_loss += float(loss.item())
-        total_dice += compute_batch_volume_dice(outputs, batch.masks)
+        total_dice += compute_batch_volume_dice(outputs_stage2, batch.masks)
         n_batch += 1
+
+        core_model.set_middle_prompt_enabled(False)
 
     if n_batch == 0:
         avg_loss, avg_dice = 0.0, 0.0
@@ -312,6 +345,23 @@ def save_ckpt(path: Path, epoch: int, model, optimizer, scheduler, scaler, best_
         },
         str(path),
     )
+
+
+def load_ckpt(path: Path, model, optimizer=None, scheduler=None, scaler=None, map_location="cpu"):
+    state = torch.load(str(path), map_location=map_location)
+    model_state = state["model"] if isinstance(state, dict) and "model" in state else state
+    unwrap_model(model).load_state_dict(model_state, strict=False)
+
+    if optimizer is not None and isinstance(state, dict) and state.get("optimizer") is not None:
+        optimizer.load_state_dict(state["optimizer"])
+    if scheduler is not None and isinstance(state, dict) and state.get("scheduler") is not None:
+        scheduler.load_state_dict(state["scheduler"])
+    if scaler is not None and isinstance(state, dict) and state.get("scaler") is not None:
+        scaler.load_state_dict(state["scaler"])
+
+    last_epoch = int(state.get("epoch", 0)) if isinstance(state, dict) else 0
+    best_val_dice = float(state.get("best_val_dice", -1.0)) if isinstance(state, dict) else -1.0
+    return last_epoch, best_val_dice
 
 
 def make_folds(patient_dirs, num_folds: int, seed: int):
@@ -363,6 +413,17 @@ def main():
     parser.add_argument("--no-freeze-image-encoder", dest="freeze_image_encoder", action="store_false")
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--amp-dtype", type=str, default="bfloat16", choices=["bfloat16", "float16"])
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Resume each fold from fold_x/checkpoints/last.pth when available.",
+    )
+    parser.add_argument(
+        "--resume-folds",
+        type=str,
+        default="",
+        help="Optional comma-separated fold ids to resume only, e.g. '2,3'. Empty means all folds.",
+    )
     args = parser.parse_args()
 
     # Full-case training uses variable number of frames across patients.
@@ -418,6 +479,9 @@ def main():
     model_cfg_dict_template = load_model_cfg_dict_once(args.model_cfg)
 
     summary_rows = []
+    resume_fold_set = None
+    if args.resume_folds.strip():
+        resume_fold_set = set(int(x.strip()) for x in args.resume_folds.split(",") if x.strip())
     for fold_idx, (train_patients, val_patients) in enumerate(fold_defs):
         if is_main_process():
             print(f"\n[Fold {fold_idx}] train={len(train_patients)} val={len(val_patients)}")
@@ -476,7 +540,7 @@ def main():
             device=device,
         )
         if use_ddp:
-            model = DDP(model, device_ids=[local_rank], output_device=local_rank, find_unused_parameters=False)
+            model = DDP(model, device_ids=[local_rank], output_device=local_rank, find_unused_parameters=True)
 
         optimizer = build_optimizer(model, args.base_lr, args.vision_lr, args.weight_decay)
         scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
@@ -499,10 +563,47 @@ def main():
         best_val_dice = -1.0
         best_epoch = -1
         history = []
-        for epoch in range(args.epochs):
+        start_epoch = 0
+        if args.resume and (resume_fold_set is None or fold_idx in resume_fold_set):
+            resume_ckpt = ckpt_dir / "last.pth"
+            if resume_ckpt.exists():
+                start_epoch, best_val_dice = load_ckpt(
+                    path=resume_ckpt,
+                    model=model,
+                    optimizer=optimizer,
+                    scheduler=scheduler,
+                    scaler=scaler,
+                    map_location="cpu",
+                )
+                best_epoch = start_epoch
+                if is_main_process():
+                    print(
+                        f"[Fold {fold_idx}] Resume from {resume_ckpt} | "
+                        f"last_epoch={start_epoch} -> next_epoch={start_epoch + 1}, "
+                        f"best_val_dice={best_val_dice:.6f}"
+                    )
+                hist_json = log_dir / "history.json"
+                if hist_json.exists():
+                    try:
+                        with open(hist_json, "r", encoding="utf-8") as f:
+                            old_history = json.load(f)
+                        if isinstance(old_history, list):
+                            history = old_history
+                    except Exception:
+                        if is_main_process():
+                            print(f"[Fold {fold_idx}] WARN: failed to read history.json, continue with empty history")
+
+        if start_epoch >= args.epochs:
+            if is_main_process():
+                print(
+                    f"[Fold {fold_idx}] Already finished "
+                    f"(last_epoch={start_epoch}, target_epochs={args.epochs}), skip training loop."
+                )
+
+        for epoch in range(start_epoch, args.epochs):
             if train_sampler is not None:
                 train_sampler.set_epoch(epoch)
-            tr_loss, tr_dice = run_epoch(
+            tr_loss, tr_dice = run_epoch_two_pass(
                 model=model,
                 loader=train_loader,
                 loss_fn=loss_fn,
@@ -513,7 +614,7 @@ def main():
                 train_mode=True,
             )
             with torch.no_grad():
-                va_loss, va_dice = run_epoch(
+                va_loss, va_dice = run_epoch_two_pass(
                     model=model,
                     loader=val_loader,
                     loss_fn=loss_fn,

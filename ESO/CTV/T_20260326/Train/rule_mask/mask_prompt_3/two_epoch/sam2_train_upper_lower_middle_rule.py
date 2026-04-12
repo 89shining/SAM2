@@ -35,6 +35,10 @@ class SAM2TrainUpperLowerMiddleRuleMask(SAM2Train):
             )
         )
         super().__init__(*args, **kwargs)
+        self.enable_middle_prompt = False
+
+    def set_middle_prompt_enabled(self, enabled: bool):
+        self.enable_middle_prompt = bool(enabled)
 
     @staticmethod
     def _choose_middle_rule(pos_t: torch.Tensor, lower: int, upper: int) -> int:
@@ -79,30 +83,43 @@ class SAM2TrainUpperLowerMiddleRuleMask(SAM2Train):
             else:
                 lower = int(pos_t.min().item())
                 upper = int(pos_t.max().item())
-                middle = self._choose_middle_rule(pos_t, lower, upper)
+                if self.enable_middle_prompt:
+                    middle = self._choose_middle_rule(pos_t, lower, upper)
+                else:
+                    middle = None
 
             lower_ids.append(lower)
             upper_ids.append(upper)
             middle_ids.append(middle)
 
         init_cond_frames = sorted(set(lower_ids + upper_ids))
-        middle_prompt_frames = sorted(set(middle_ids) - set(init_cond_frames))
-
-        remaining_frames = [
-            t for t in range(start_frame_idx, num_frames) if t not in init_cond_frames
-        ]
-        remaining_wo_middle = [t for t in remaining_frames if t not in middle_prompt_frames]
-
         backbone_out["init_cond_frames"] = init_cond_frames
-        backbone_out["frames_not_in_init_cond"] = middle_prompt_frames + remaining_wo_middle
+        if self.enable_middle_prompt:
+            middle_prompt_frames = sorted(
+                set([m for m in middle_ids if m is not None]) - set(init_cond_frames)
+            )
+            remaining_frames = [
+                t for t in range(start_frame_idx, num_frames) if t not in init_cond_frames
+            ]
+            remaining_wo_middle = [t for t in remaining_frames if t not in middle_prompt_frames]
+            backbone_out["frames_not_in_init_cond"] = middle_prompt_frames + remaining_wo_middle
+        else:
+            backbone_out["frames_not_in_init_cond"] = [
+                t for t in range(start_frame_idx, num_frames) if t not in init_cond_frames
+            ]
 
         backbone_out["mask_inputs_per_frame"] = {}
-        prompt_frames = sorted(set(init_cond_frames + middle_ids))
+        if self.enable_middle_prompt:
+            prompt_frames = sorted(set(init_cond_frames + [m for m in middle_ids if m is not None]))
+        else:
+            prompt_frames = init_cond_frames
         for t in prompt_frames:
             gt_t = gt_masks_per_frame[t]  # [O, 1, H, W]
             prompt_t = torch.zeros_like(gt_t)
             for o in range(o_dim):
-                if lower_ids[o] == t or upper_ids[o] == t or middle_ids[o] == t:
+                if lower_ids[o] == t or upper_ids[o] == t or (
+                    self.enable_middle_prompt and middle_ids[o] is not None and middle_ids[o] == t
+                ):
                     prompt_t[o] = gt_t[o]
             backbone_out["mask_inputs_per_frame"][t] = prompt_t
 

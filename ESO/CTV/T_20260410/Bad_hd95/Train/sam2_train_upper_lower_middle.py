@@ -1,20 +1,16 @@
 ﻿import torch
-
 from training.model.sam2 import SAM2Train
 
 
-class SAM2TrainUpperLowerMiddleMask(SAM2Train):
+class SAM2TrainUpperLowerDynamicMiddleMask(SAM2Train):
     """
-    Train/eval with mask prompts only:
-    - For each object, automatically find GT-positive temporal bounds (lower/upper).
-    - Read patient-level middle prompt index from external table (mask_prompt_3 result).
-    - Iterative prompt schedule:
-      stage-1 give upper + lower as initial conditioning prompts,
-      stage-2 add middle prompt on top of current tracking state.
-    - Disable point/box prompts and iterative correction clicks.
+    Two-pass training/eval:
+    - pass-1: boundary-only (upper + lower mask prompts)
+    - select middle frame online from pass-1 prediction
+    - pass-2: boundary + selected middle mask prompt
     """
 
-    def __init__(self, *args, middle_prompt_by_video_id=None, **kwargs):
+    def __init__(self, *args, **kwargs):
         kwargs.update(
             dict(
                 prob_to_use_pt_input_for_train=0.0,
@@ -33,13 +29,19 @@ class SAM2TrainUpperLowerMiddleMask(SAM2Train):
             )
         )
         super().__init__(*args, **kwargs)
-        self.middle_prompt_by_video_id = {
-            int(k): int(v) for k, v in (middle_prompt_by_video_id or {}).items()
-        }
+
+        self.runtime_middle_prompt_by_video_id = {}
         self.enable_middle_prompt = False
 
-    def set_middle_prompt_enabled(self, enabled: bool):
-        self.enable_middle_prompt = bool(enabled)
+    def set_runtime_middle_prompt_map(self, mapping):
+        self.runtime_middle_prompt_by_video_id = {
+            int(k): int(v) for k, v in (mapping or {}).items()
+        }
+        self.enable_middle_prompt = len(self.runtime_middle_prompt_by_video_id) > 0
+
+    def clear_runtime_middle_prompt_map(self):
+        self.runtime_middle_prompt_by_video_id = {}
+        self.enable_middle_prompt = False
 
     @staticmethod
     def _choose_fallback_middle(pos_t: torch.Tensor, lower: int, upper: int) -> int:
@@ -55,8 +57,6 @@ class SAM2TrainUpperLowerMiddleMask(SAM2Train):
         mid = max(0, min(int(mid), t_dim - 1))
         if bool(gt_obj_t_hw[mid].any()):
             return mid
-
-        # If external id is invalid for this object, fallback to lower (always positive by construction).
         if bool(gt_obj_t_hw[lower].any()):
             return int(lower)
         if bool(gt_obj_t_hw[upper].any()):
@@ -76,8 +76,7 @@ class SAM2TrainUpperLowerMiddleMask(SAM2Train):
         backbone_out["point_inputs_per_frame"] = {}
         backbone_out["frames_to_add_correction_pt"] = []
 
-        # input.masks: [T, O, H, W]
-        masks_tohw = input.masks
+        masks_tohw = input.masks  # [T, O, H, W]
         if masks_tohw.ndim != 4:
             raise ValueError(f"Expected input.masks to be [T, O, H, W], got {masks_tohw.shape}")
 
@@ -85,8 +84,6 @@ class SAM2TrainUpperLowerMiddleMask(SAM2Train):
         if t_dim != num_frames:
             raise ValueError(f"num_frames mismatch: {num_frames} vs {t_dim}")
 
-        # [T, O, 3] -> use t=0 because video_id is constant over time for one object.
-        # unique_objects_identifier[..., 0] stores original video_id.
         obj_video_ids = input.metadata.unique_objects_identifier[0, :, 0].to(torch.long)
 
         lower_ids = []
@@ -107,10 +104,9 @@ class SAM2TrainUpperLowerMiddleMask(SAM2Train):
 
                 if self.enable_middle_prompt:
                     video_id = int(obj_video_ids[obj_idx].item())
-                    external_mid = self.middle_prompt_by_video_id.get(video_id)
+                    external_mid = self.runtime_middle_prompt_by_video_id.get(video_id)
                     if external_mid is None:
                         external_mid = self._choose_fallback_middle(pos_t, lower, upper)
-
                     middle = self._valid_mid_for_object(
                         gt_obj_t_hw=masks_tohw[:, obj_idx],
                         mid=int(external_mid),
@@ -124,11 +120,8 @@ class SAM2TrainUpperLowerMiddleMask(SAM2Train):
             upper_ids.append(upper)
             middle_ids.append(middle)
 
-        # Iterative doctor-like prompting:
-        # 1) first use boundary prompts (upper/lower) as initial conditioning;
-        # 2) then inject middle prompt before processing remaining frames.
         init_cond_frames = sorted(set(lower_ids + upper_ids))
-        backbone_out["init_cond_frames"] = init_cond_frames
+
         if self.enable_middle_prompt:
             middle_prompt_frames = sorted(
                 set([m for m in middle_ids if m is not None]) - set(init_cond_frames)
@@ -143,13 +136,16 @@ class SAM2TrainUpperLowerMiddleMask(SAM2Train):
                 t for t in range(start_frame_idx, num_frames) if t not in init_cond_frames
             ]
 
+        backbone_out["init_cond_frames"] = init_cond_frames
         backbone_out["mask_inputs_per_frame"] = {}
+
         if self.enable_middle_prompt:
             prompt_frames = sorted(set(init_cond_frames + [m for m in middle_ids if m is not None]))
         else:
             prompt_frames = init_cond_frames
+
         for t in prompt_frames:
-            gt_t = gt_masks_per_frame[t]  # [O, 1, H, W]
+            gt_t = gt_masks_per_frame[t]  # [O,1,H,W]
             prompt_t = torch.zeros_like(gt_t)
             for o in range(o_dim):
                 if lower_ids[o] == t or upper_ids[o] == t or (
