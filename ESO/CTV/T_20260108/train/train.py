@@ -201,7 +201,7 @@ def sam2_forward_2d(model, image, mask_prompt):
 
 
 # =========================
-# Train one fold
+# two_epoch one fold
 # =========================
 def train_one_fold(fold_id: int, train_pids: list[str], val_pids: list[str]):
     fold_dir = SAVE_ROOT / f"fold_{fold_id}"

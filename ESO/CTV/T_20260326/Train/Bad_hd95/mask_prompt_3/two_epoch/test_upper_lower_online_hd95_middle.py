@@ -50,10 +50,10 @@ from sam2.build_sam import build_sam2_video_predictor
 
 # ================= Default Paths (edit here) =================
 DEFAULT_TEST_ROOT = Path("/home/wusi/SAM2/SAM2data/Eso/20260326/datanii/test_nii")
-DEFAULT_OUTPUT_ROOT = Path("/home/wusi/SAM2/SAM2data/Eso/20260410/Train/mask_prompt_3/BadHD95_slice/TestResult")
+DEFAULT_OUTPUT_ROOT = Path("/home/wusi/SAM2/SAM2data/Eso/20260326/Train/BadHD95_slice/mask_prompt_3/two_epoch/TestResult")
 DEFAULT_MODEL_CFG = "configs/sam2.1/sam2.1_hiera_l.yaml"
-DEFAULT_FINETUNED_CKPT = Path("/home/wusi/SAM2/SAM2data/Eso/20260410/Train/mask_prompt_3/BadHD95_slice/TrainResult/fold_0/checkpoints/best.pth")
-DEFAULT_TRAIN_OUTPUT_ROOT = Path("/home/wusi/SAM2/SAM2data/Eso/20260326/20260410/Train/mask_prompt_3/BadHD95_slice/TrainResult")
+DEFAULT_FINETUNED_CKPT = Path("/home/wusi/SAM2/SAM2data/Eso/20260326/Train/BadHD95_slice/mask_prompt_3/two_epoch/TrainResult/fold_0/checkpoints/best.pth")
+DEFAULT_TRAIN_OUTPUT_ROOT = Path("/home/wusi/SAM2/SAM2data/Eso/20260326/Train/BadHD95_slice/mask_prompt_3/two_epoch/TrainResult")
 
 
 def window_to_uint8(img2d: np.ndarray, wc: float, ww: float) -> np.ndarray:
@@ -160,11 +160,11 @@ def infer_with_boundary_then_online_hd95_middle(
     lower_id: int,
     upper_id: int,
     obj_id: int,
+    two_pass_mode: str = "iterative",
 ):
+    # Pass-1: boundary only
     state = predictor.init_state(video_path=str(frame_dir))
     predictor.reset_state(state)
-
-    # Pass-1: boundary only
     boundary_ids = [int(upper_id)]
     if int(lower_id) != int(upper_id):
         boundary_ids.append(int(lower_id))
@@ -182,6 +182,7 @@ def infer_with_boundary_then_online_hd95_middle(
 
     pred_stage1 = _propagate_to_mask(state, predictor, gt_zyx, obj_id)
 
+    # Select middle from pass-1 prediction.
     middle_id = select_middle_from_first_pass_hd95(
         pred_zyx=pred_stage1,
         gt_zyx=gt_zyx,
@@ -189,17 +190,38 @@ def infer_with_boundary_then_online_hd95_middle(
         upper_id=upper_id,
     )
 
-    # Pass-2: add online-selected middle
-    if middle_id not in boundary_ids:
-        mid_mask = (gt_zyx[middle_id] > 0).astype(np.uint8)
-        if mid_mask.sum() == 0:
-            raise RuntimeError(f"Prompt slice {middle_id} is empty in GT.")
-        predictor.add_new_mask(
-            inference_state=state,
-            frame_idx=middle_id,
-            obj_id=obj_id,
-            mask=mid_mask,
-        )
+    # Pass-2:
+    # - iterative: continue from pass-1 state and add middle only
+    # - independent: re-init and feed upper/lower/middle together
+    if two_pass_mode == "iterative":
+        if middle_id not in boundary_ids:
+            mid_mask = (gt_zyx[middle_id] > 0).astype(np.uint8)
+            if mid_mask.sum() == 0:
+                raise RuntimeError(f"Prompt slice {middle_id} is empty in GT.")
+            predictor.add_new_mask(
+                inference_state=state,
+                frame_idx=middle_id,
+                obj_id=obj_id,
+                mask=mid_mask,
+            )
+    else:
+        state = predictor.init_state(video_path=str(frame_dir))
+        predictor.reset_state(state)
+        prompt_ids = [int(upper_id)]
+        if int(lower_id) != int(upper_id):
+            prompt_ids.append(int(lower_id))
+        if int(middle_id) not in prompt_ids:
+            prompt_ids.append(int(middle_id))
+        for sid in prompt_ids:
+            prompt_mask = (gt_zyx[sid] > 0).astype(np.uint8)
+            if prompt_mask.sum() == 0:
+                raise RuntimeError(f"Prompt slice {sid} is empty in GT.")
+            predictor.add_new_mask(
+                inference_state=state,
+                frame_idx=sid,
+                obj_id=obj_id,
+                mask=prompt_mask,
+            )
 
     pred_stage2 = _propagate_to_mask(state, predictor, gt_zyx, obj_id)
     return pred_stage1, pred_stage2, middle_id
@@ -254,6 +276,13 @@ def main():
     parser.add_argument("--window-width", type=float, default=400.0)
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--excel-name", type=str, default="online_hd95_middle_results.xlsx")
+    parser.add_argument(
+        "--two-pass-mode",
+        type=str,
+        default="iterative",
+        choices=["iterative", "independent"],
+        help="iterative: stage2 continues on stage1 state; independent: re-init and feed 3 prompts",
+    )
     args = parser.parse_args()
 
     if not args.test_root.exists():
@@ -316,6 +345,7 @@ def main():
                 lower_id=lower_id,
                 upper_id=upper_id,
                 obj_id=args.obj_id,
+                two_pass_mode=args.two_pass_mode,
             )
             dice_stage1 = dice_3d(pred_stage1, gt_zyx)
             dice_stage2 = dice_3d(pred_stage2, gt_zyx)

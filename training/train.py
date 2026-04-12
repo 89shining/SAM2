@@ -126,7 +126,7 @@ def main(args) -> None:
         cfg.launcher.experiment_log_dir = os.path.join(
             os.getcwd(), "sam2_logs", args.config
         )
-    print("###################### Train App Config ####################")
+    print("###################### two_epoch App Config ####################")
     print(OmegaConf.to_yaml(cfg))
     print("############################################################")
 

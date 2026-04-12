@@ -298,7 +298,7 @@ def main():
         log_message(log_file, f"num_val_clips: {len(val_data.dataset.samples)}")
         log_message(log_file, "")
 
-        log_message(log_file, "[Train Patient IDs]")
+        log_message(log_file, "[two_epoch Patient IDs]")
         for name in train_patient_names:
             log_message(log_file, name)
         log_message(log_file, "")
@@ -308,7 +308,7 @@ def main():
             log_message(log_file, name)
         log_message(log_file, "")
 
-        log_message(log_file, "[Train Clips Preview]")
+        log_message(log_file, "[two_epoch Clips Preview]")
         for i, s in enumerate(train_data.dataset.samples[:30]):
             log_message(
                 log_file,
@@ -371,7 +371,7 @@ def main():
             )
 
             writer.add_scalar("train/loss", train_loss, epoch)
-            log_message(log_file, f"[Fold {fold_index}] Epoch {epoch + 1} Train Loss: {train_loss:.4f}")
+            log_message(log_file, f"[Fold {fold_index}] Epoch {epoch + 1} two_epoch Loss: {train_loss:.4f}")
 
             if (epoch + 1) % cfg.scratch.val_every == 0:
                 val_loader = val_data.get_loader(epoch)

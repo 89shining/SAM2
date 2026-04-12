@@ -730,7 +730,7 @@ class Trainer:
                 *loss_mts.values(),
             ],
             self._get_meters([phase]),
-            prefix="Train Epoch: [{}]".format(self.epoch),
+            prefix="two_epoch Epoch: [{}]".format(self.epoch),
         )
 
         # Model training loop

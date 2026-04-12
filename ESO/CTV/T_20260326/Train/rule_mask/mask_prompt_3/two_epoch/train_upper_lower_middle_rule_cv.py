@@ -15,6 +15,7 @@ import os
 import random
 import re
 import sys
+from contextlib import nullcontext
 from pathlib import Path
 
 import numpy as np
@@ -269,7 +270,132 @@ def reduce_scalar(value: float, device: torch.device) -> float:
     return float(t.item())
 
 
-def run_epoch_two_pass(model, loader, loss_fn, optimizer, scaler, device, amp_dtype, train_mode: bool):
+def _clone_backbone_out(backbone_out: dict) -> dict:
+    # Shallow copy is enough: tensors are immutable for our usage here.
+    return {k: v for k, v in backbone_out.items()}
+
+
+def _precompute_backbone_out(core_model, batch):
+    if core_model.training or not core_model.forward_backbone_per_frame_for_eval:
+        return core_model.forward_image(batch.flat_img_batch)
+    return {"backbone_fpn": None, "vision_pos_enc": None}
+
+
+def _outputs_from_tracking_dict(output_dict: dict, num_frames: int):
+    all_frame_outputs = {}
+    all_frame_outputs.update(output_dict["cond_frame_outputs"])
+    all_frame_outputs.update(output_dict["non_cond_frame_outputs"])
+    all_frame_outputs = [all_frame_outputs[t] for t in range(num_frames)]
+    # Keep behavior aligned with SAM2Train.forward_tracking.
+    all_frame_outputs = [
+        {k: v for k, v in d.items() if k != "obj_ptr"} for d in all_frame_outputs
+    ]
+    return all_frame_outputs
+
+
+def _forward_tracking_iterative(
+    core_model,
+    backbone_out,
+    batch,
+    output_dict=None,
+    processing_order=None,
+):
+    img_feats_already_computed = backbone_out["backbone_fpn"] is not None
+    if img_feats_already_computed:
+        (
+            _,
+            vision_feats,
+            vision_pos_embeds,
+            feat_sizes,
+        ) = core_model._prepare_backbone_features(backbone_out)
+
+    num_frames = backbone_out["num_frames"]
+    init_cond_frames = backbone_out["init_cond_frames"]
+    frames_to_add_correction_pt = backbone_out["frames_to_add_correction_pt"]
+
+    if output_dict is None:
+        output_dict = {
+            "cond_frame_outputs": {},
+            "non_cond_frame_outputs": {},
+        }
+    if processing_order is None:
+        processing_order = init_cond_frames + backbone_out["frames_not_in_init_cond"]
+
+    for stage_id in processing_order:
+        img_ids = batch.flat_obj_to_img_idx[stage_id]
+        if img_feats_already_computed:
+            current_vision_feats = [x[:, img_ids] for x in vision_feats]
+            current_vision_pos_embeds = [x[:, img_ids] for x in vision_pos_embeds]
+        else:
+            (
+                _,
+                current_vision_feats,
+                current_vision_pos_embeds,
+                feat_sizes,
+            ) = core_model._prepare_backbone_features_per_frame(
+                batch.flat_img_batch, img_ids
+            )
+
+        current_out = core_model.track_step(
+            frame_idx=stage_id,
+            is_init_cond_frame=stage_id in init_cond_frames,
+            current_vision_feats=current_vision_feats,
+            current_vision_pos_embeds=current_vision_pos_embeds,
+            feat_sizes=feat_sizes,
+            point_inputs=backbone_out["point_inputs_per_frame"].get(stage_id, None),
+            mask_inputs=backbone_out["mask_inputs_per_frame"].get(stage_id, None),
+            gt_masks=backbone_out["gt_masks_per_frame"].get(stage_id, None),
+            frames_to_add_correction_pt=frames_to_add_correction_pt,
+            output_dict=output_dict,
+            num_frames=num_frames,
+        )
+        add_output_as_cond_frame = stage_id in init_cond_frames or (
+            core_model.add_all_frames_to_correct_as_cond
+            and stage_id in frames_to_add_correction_pt
+        )
+        if add_output_as_cond_frame:
+            output_dict["cond_frame_outputs"][stage_id] = current_out
+            output_dict["non_cond_frame_outputs"].pop(stage_id, None)
+        else:
+            output_dict["non_cond_frame_outputs"][stage_id] = current_out
+            output_dict["cond_frame_outputs"].pop(stage_id, None)
+
+    return output_dict
+
+
+def _append_middle_prompts_inplace(core_model, base_backbone_out, backbone_stage1, batch):
+    # Build stage-2 prompt layout, then append only the new middle prompts to stage-1 backbone_out.
+    stage2_backbone = core_model.prepare_prompt_inputs(
+        _clone_backbone_out(base_backbone_out), batch
+    )
+    old_init = set(backbone_stage1["init_cond_frames"])
+    new_init = set(stage2_backbone["init_cond_frames"])
+    middle_frames = sorted(new_init - old_init)
+
+    for t in middle_frames:
+        if t in stage2_backbone["mask_inputs_per_frame"]:
+            backbone_stage1["mask_inputs_per_frame"][t] = stage2_backbone["mask_inputs_per_frame"][t]
+
+    merged_init = sorted(old_init | set(middle_frames))
+    backbone_stage1["init_cond_frames"] = merged_init
+    num_frames = int(backbone_stage1["num_frames"])
+    backbone_stage1["frames_not_in_init_cond"] = [t for t in range(num_frames) if t not in set(merged_init)]
+    return backbone_stage1, middle_frames
+
+
+def run_epoch_two_pass(
+    model,
+    loader,
+    loss_fn,
+    optimizer,
+    scaler,
+    device,
+    amp_dtype,
+    train_mode: bool,
+    stage1_loss_weight: float,
+    stage2_loss_weight: float,
+    two_pass_mode: str,
+):
     model.train(train_mode)
     total_loss = 0.0
     total_dice = 0.0
@@ -279,25 +405,78 @@ def run_epoch_two_pass(model, loader, loss_fn, optimizer, scaler, device, amp_dt
 
     for batch in loader:
         batch = batch.to(device, non_blocking=True)
+        base_backbone_out = _precompute_backbone_out(core_model, batch)
 
         # Pass-1: boundary prompts only
         core_model.set_middle_prompt_enabled(False)
-        with torch.no_grad():
+        backbone_stage1 = core_model.prepare_prompt_inputs(
+            _clone_backbone_out(base_backbone_out), batch
+        )
+        stage1_needs_grad = stage1_loss_weight > 0.0
+        grad_ctx = nullcontext() if stage1_needs_grad else torch.no_grad()
+        with grad_ctx:
             with torch.cuda.amp.autocast(
                 enabled=(device.type == "cuda"),
                 dtype=amp_dtype,
             ):
-                _ = model(batch)
+                output_dict_stage1 = _forward_tracking_iterative(
+                    core_model, backbone_stage1, batch
+                )
+                outputs_stage1 = _outputs_from_tracking_dict(
+                    output_dict_stage1, backbone_stage1["num_frames"]
+                )
+                if stage1_needs_grad:
+                    loss_dict_stage1 = loss_fn(outputs_stage1, batch.masks)
+                    loss_stage1 = (
+                        loss_dict_stage1["core_loss"]
+                        if isinstance(loss_dict_stage1, dict)
+                        else loss_dict_stage1
+                    )
+                else:
+                    loss_stage1 = torch.zeros((), device=device, dtype=torch.float32)
 
-        # Pass-2: boundary + rule-middle prompt
+        # Pass-2:
+        # - iterative: continue on stage-1 memory and inject middle prompt
+        # - independent: fresh second forward with upper/lower/middle
         core_model.set_middle_prompt_enabled(True)
         with torch.cuda.amp.autocast(
             enabled=(device.type == "cuda"),
             dtype=amp_dtype,
         ):
-            outputs_stage2 = model(batch)
-            loss_dict = loss_fn(outputs_stage2, batch.masks)
-            loss = loss_dict["core_loss"] if isinstance(loss_dict, dict) else loss_dict
+            if two_pass_mode == "iterative":
+                backbone_stage2, middle_frames = _append_middle_prompts_inplace(
+                    core_model, base_backbone_out, backbone_stage1, batch
+                )
+                output_dict_stage2 = _forward_tracking_iterative(
+                    core_model,
+                    backbone_stage2,
+                    batch,
+                    output_dict=output_dict_stage1,
+                    processing_order=middle_frames + [
+                        t
+                        for t in backbone_stage2["frames_not_in_init_cond"]
+                        if t not in set(middle_frames)
+                    ],
+                )
+            else:
+                backbone_stage2 = core_model.prepare_prompt_inputs(
+                    _clone_backbone_out(base_backbone_out), batch
+                )
+                output_dict_stage2 = _forward_tracking_iterative(
+                    core_model,
+                    backbone_stage2,
+                    batch,
+                )
+            outputs_stage2 = _outputs_from_tracking_dict(
+                output_dict_stage2, backbone_stage2["num_frames"]
+            )
+            loss_dict_stage2 = loss_fn(outputs_stage2, batch.masks)
+            loss_stage2 = (
+                loss_dict_stage2["core_loss"]
+                if isinstance(loss_dict_stage2, dict)
+                else loss_dict_stage2
+            )
+            loss = stage1_loss_weight * loss_stage1 + stage2_loss_weight * loss_stage2
 
         if train_mode:
             optimizer.zero_grad(set_to_none=True)
@@ -413,6 +592,15 @@ def main():
     parser.add_argument("--no-freeze-image-encoder", dest="freeze_image_encoder", action="store_false")
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--amp-dtype", type=str, default="bfloat16", choices=["bfloat16", "float16"])
+    parser.add_argument("--stage1-loss-weight", type=float, default=0.0)
+    parser.add_argument("--stage2-loss-weight", type=float, default=1.0)
+    parser.add_argument(
+        "--two-pass-mode",
+        type=str,
+        default="iterative",
+        choices=["iterative", "independent"],
+        help="iterative: stage2 continues on stage1 memory; independent: two standalone forwards",
+    )
     parser.add_argument(
         "--resume",
         action="store_true",
@@ -612,6 +800,9 @@ def main():
                 device=device,
                 amp_dtype=amp_dtype,
                 train_mode=True,
+                stage1_loss_weight=args.stage1_loss_weight,
+                stage2_loss_weight=args.stage2_loss_weight,
+                two_pass_mode=args.two_pass_mode,
             )
             with torch.no_grad():
                 va_loss, va_dice = run_epoch_two_pass(
@@ -623,6 +814,9 @@ def main():
                     device=device,
                     amp_dtype=amp_dtype,
                     train_mode=False,
+                    stage1_loss_weight=args.stage1_loss_weight,
+                    stage2_loss_weight=args.stage2_loss_weight,
+                    two_pass_mode=args.two_pass_mode,
                 )
             scheduler.step(va_dice)
 

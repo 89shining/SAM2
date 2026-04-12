@@ -376,7 +376,7 @@ def main():
     parser.add_argument(
         "--train-pred-root",
         type=Path,
-        default=Path("/home/wusi/SAM2/SAM2data/Eso/20260326/Train/oracle_mask/mask_prompt_2/TestResult/best_mask"),
+        default=Path("/home/wusi/SAM2/SAM2data/Eso/20260326/two_epoch/oracle_mask/mask_prompt_2/TestResult/best_mask"),
     )
     parser.add_argument(
         "--zero-pred-root",

@@ -182,11 +182,11 @@ def infer_with_iterative_three_prompt_slices(
     upper_id: int,
     middle_id: int,
     obj_id: int,
+    two_pass_mode: str = "iterative",
 ):
+    # Stage-1: upper/lower prompts
     state = predictor.init_state(video_path=str(frame_dir))
     predictor.reset_state(state)
-
-    # Stage-1: upper/lower prompts
     boundary_ids = [int(upper_id)]
     if int(lower_id) != int(upper_id):
         boundary_ids.append(int(lower_id))
@@ -203,18 +203,39 @@ def infer_with_iterative_three_prompt_slices(
 
     pred_stage1 = _propagate_to_mask(state, predictor, gt_zyx, obj_id)
 
-    # Stage-2: add middle prompt on top of stage-1 state
-    mid = int(middle_id)
-    if mid not in boundary_ids:
-        mid_mask = (gt_zyx[mid] > 0).astype(np.uint8)
-        if mid_mask.sum() == 0:
-            raise RuntimeError(f"Prompt slice {mid} is empty in GT.")
-        predictor.add_new_mask(
-            inference_state=state,
-            frame_idx=mid,
-            obj_id=obj_id,
-            mask=mid_mask,
-        )
+    # Stage-2:
+    # - iterative: continue from stage-1 state and add middle only
+    # - independent: re-init and feed upper/lower/middle together
+    if two_pass_mode == "iterative":
+        mid = int(middle_id)
+        if mid not in boundary_ids:
+            mid_mask = (gt_zyx[mid] > 0).astype(np.uint8)
+            if mid_mask.sum() == 0:
+                raise RuntimeError(f"Prompt slice {mid} is empty in GT.")
+            predictor.add_new_mask(
+                inference_state=state,
+                frame_idx=mid,
+                obj_id=obj_id,
+                mask=mid_mask,
+            )
+    else:
+        state = predictor.init_state(video_path=str(frame_dir))
+        predictor.reset_state(state)
+        prompt_ids = [int(upper_id)]
+        if int(lower_id) != int(upper_id):
+            prompt_ids.append(int(lower_id))
+        if int(middle_id) not in prompt_ids:
+            prompt_ids.append(int(middle_id))
+        for sid in prompt_ids:
+            prompt_mask = (gt_zyx[sid] > 0).astype(np.uint8)
+            if prompt_mask.sum() == 0:
+                raise RuntimeError(f"Prompt slice {sid} is empty in GT.")
+            predictor.add_new_mask(
+                inference_state=state,
+                frame_idx=sid,
+                obj_id=obj_id,
+                mask=prompt_mask,
+            )
 
     pred_stage2 = _propagate_to_mask(state, predictor, gt_zyx, obj_id)
     return pred_stage1, pred_stage2
@@ -271,6 +292,13 @@ def main():
     parser.add_argument("--window-width", type=float, default=400.0)
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--excel-name", type=str, default="prompt_layer_search3.xlsx")
+    parser.add_argument(
+        "--two-pass-mode",
+        type=str,
+        default="iterative",
+        choices=["iterative", "independent"],
+        help="iterative: stage2 continues on stage1 state; independent: re-init and feed 3 prompts",
+    )
     args = parser.parse_args()
 
     if not args.test_root.exists():
@@ -359,6 +387,7 @@ def main():
                 upper_id=upper_id,
                 middle_id=middle_id,
                 obj_id=args.obj_id,
+                two_pass_mode=args.two_pass_mode,
             )
             dice_stage1 = dice_3d(pred_stage1, gt_zyx)
             dice_stage2 = dice_3d(pred_stage2, gt_zyx)
