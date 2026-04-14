@@ -63,11 +63,11 @@ from training.utils.data_utils import Frame, Object, VideoDatapoint, collate_fn
 
 
 # ================= Default Paths (edit here) =================
-DEFAULT_TRAIN_ROOT = Path("/home/wusi/SAM2/SAM2data/Eso/20260326/datanii/train_nii")
-DEFAULT_PROMPT3_XLSX = Path("/home/wusi/SAM2/SAM2data/Eso/20260326/zero-shot/oracle_mask/mask_prompt_3/prompt_layer_search3.xlsx")
-DEFAULT_OUTPUT_ROOT = Path("/home/wusi/SAM2/SAM2data/Eso/20260326/Train/oracle_mask/mask_prompt_3/two_epoch/TrainResult")
+DEFAULT_TRAIN_ROOT = Path("/home/intern/ftp/wusi/SAM2/SAM2data/Eso/20260326/datanii/train_nii")
+DEFAULT_PROMPT3_XLSX = Path("/home/intern/ftp/wusi/SAM2/SAM2data/Eso/20260326/zero-shot/oracle_mask/mask_prompt_3/prompt_layer_search3.xlsx")
+DEFAULT_OUTPUT_ROOT = Path("/home/intern/ftp/wusi/SAM2/SAM2data/Eso/20260326/Train/oracle_mask/mask_prompt_3/two_epoch/TrainResult")
 DEFAULT_MODEL_CFG = "configs/sam2.1/sam2.1_hiera_l.yaml"
-DEFAULT_PRETRAINED_CKPT = Path("/home/wusi/SAM2/checkpoints/sam2.1_hiera_large.pt")
+DEFAULT_PRETRAINED_CKPT = Path("/home/intern/ftp/wusi/SAM2/checkpoints/sam2.1_hiera_large.pt")
 
 
 def set_seed(seed: int):
@@ -382,12 +382,31 @@ def reduce_scalar(value: float, device: torch.device) -> float:
     return float(t.item())
 
 
+def configure_cuda_allocator(
+    max_split_size_mb: int,
+    gc_threshold: float,
+    expandable_segments: bool,
+):
+    conf_items = []
+    if max_split_size_mb > 0:
+        conf_items.append(f"max_split_size_mb:{int(max_split_size_mb)}")
+    if gc_threshold > 0:
+        conf_items.append(f"garbage_collection_threshold:{float(gc_threshold)}")
+    conf_items.append(f"expandable_segments:{'True' if expandable_segments else 'False'}")
+    conf = ",".join(conf_items)
+    prev = os.environ.get("PYTORCH_CUDA_ALLOC_CONF", "").strip()
+    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = f"{prev},{conf}" if prev else conf
+    print(f"[INFO] PYTORCH_CUDA_ALLOC_CONF={os.environ['PYTORCH_CUDA_ALLOC_CONF']}")
+
+
 def _clone_backbone_out(backbone_out: dict) -> dict:
     # Shallow copy is enough: tensors are immutable for our usage here.
     return {k: v for k, v in backbone_out.items()}
 
 
-def _precompute_backbone_out(core_model, batch):
+def _precompute_backbone_out(core_model, batch, forward_backbone_per_frame: bool = False):
+    if forward_backbone_per_frame:
+        return {"backbone_fpn": None, "vision_pos_enc": None}
     if core_model.training or not core_model.forward_backbone_per_frame_for_eval:
         return core_model.forward_image(batch.flat_img_batch)
     return {"backbone_fpn": None, "vision_pos_enc": None}
@@ -507,6 +526,8 @@ def run_epoch_two_pass(
     stage1_loss_weight: float,
     stage2_loss_weight: float,
     two_pass_mode: str,
+    forward_backbone_per_frame: bool = False,
+    empty_cache_every: int = 0,
 ):
     model.train(train_mode)
     total_loss = 0.0
@@ -515,9 +536,13 @@ def run_epoch_two_pass(
 
     core_model = unwrap_model(model)
 
-    for batch in loader:
+    for batch_idx, batch in enumerate(loader, start=1):
         batch = batch.to(device, non_blocking=True)
-        base_backbone_out = _precompute_backbone_out(core_model, batch)
+        base_backbone_out = _precompute_backbone_out(
+            core_model,
+            batch,
+            forward_backbone_per_frame=forward_backbone_per_frame,
+        )
 
         # Pass-1: boundary prompts only
         core_model.set_middle_prompt_enabled(False)
@@ -534,10 +559,10 @@ def run_epoch_two_pass(
                 output_dict_stage1 = _forward_tracking_iterative(
                     core_model, backbone_stage1, batch
                 )
-                outputs_stage1 = _outputs_from_tracking_dict(
-                    output_dict_stage1, backbone_stage1["num_frames"]
-                )
                 if stage1_needs_grad:
+                    outputs_stage1 = _outputs_from_tracking_dict(
+                        output_dict_stage1, backbone_stage1["num_frames"]
+                    )
                     loss_dict_stage1 = loss_fn(outputs_stage1, batch.masks)
                     loss_stage1 = (
                         loss_dict_stage1["core_loss"]
@@ -601,6 +626,12 @@ def run_epoch_two_pass(
         n_batch += 1
 
         core_model.set_middle_prompt_enabled(False)
+        if (
+            empty_cache_every > 0
+            and device.type == "cuda"
+            and (batch_idx % empty_cache_every) == 0
+        ):
+            torch.cuda.empty_cache()
 
     if n_batch == 0:
         avg_loss, avg_dice = 0.0, 0.0
@@ -706,6 +737,40 @@ def main():
     parser.add_argument("--allow-missing-middle", action="store_true", help="Allow cases missing Best_Prompt_Slice_ID and fallback in model")
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--amp-dtype", type=str, default="bfloat16", choices=["bfloat16", "float16"])
+    parser.add_argument(
+        "--forward-backbone-per-frame",
+        action="store_true",
+        help="Compute image backbone features on demand per frame (lower GPU memory, slower).",
+    )
+    parser.add_argument(
+        "--empty-cache-every",
+        type=int,
+        default=0,
+        help="Call torch.cuda.empty_cache every N batches (0 disables). Useful for fragmentation OOM.",
+    )
+    parser.add_argument(
+        "--cuda-alloc-max-split-mb",
+        type=int,
+        default=128,
+        help="Set max_split_size_mb in PYTORCH_CUDA_ALLOC_CONF (0 disables).",
+    )
+    parser.add_argument(
+        "--cuda-alloc-gc-threshold",
+        type=float,
+        default=0.8,
+        help="Set garbage_collection_threshold in PYTORCH_CUDA_ALLOC_CONF (<=0 disables).",
+    )
+    parser.add_argument(
+        "--cuda-alloc-expandable-segments",
+        action="store_true",
+        default=True,
+        help="Enable expandable_segments in PYTORCH_CUDA_ALLOC_CONF.",
+    )
+    parser.add_argument(
+        "--no-cuda-alloc-expandable-segments",
+        dest="cuda_alloc_expandable_segments",
+        action="store_false",
+    )
     parser.add_argument("--stage1-loss-weight", type=float, default=0.0)
     parser.add_argument("--stage2-loss-weight", type=float, default=1.0)
     parser.add_argument(
@@ -727,6 +792,11 @@ def main():
         help="Optional comma-separated fold ids to resume only, e.g. '2,3'. Empty means all folds.",
     )
     args = parser.parse_args()
+    configure_cuda_allocator(
+        max_split_size_mb=args.cuda_alloc_max_split_mb,
+        gc_threshold=args.cuda_alloc_gc_threshold,
+        expandable_segments=args.cuda_alloc_expandable_segments,
+    )
 
     # Full-case training uses variable number of frames across patients.
     # training.utils.data_utils.collate_fn requires equal T within one batch.
@@ -924,6 +994,8 @@ def main():
                 stage1_loss_weight=args.stage1_loss_weight,
                 stage2_loss_weight=args.stage2_loss_weight,
                 two_pass_mode=args.two_pass_mode,
+                forward_backbone_per_frame=args.forward_backbone_per_frame,
+                empty_cache_every=args.empty_cache_every,
             )
             with torch.no_grad():
                 va_loss, va_dice = run_epoch_two_pass(
@@ -938,6 +1010,8 @@ def main():
                     stage1_loss_weight=args.stage1_loss_weight,
                     stage2_loss_weight=args.stage2_loss_weight,
                     two_pass_mode=args.two_pass_mode,
+                    forward_backbone_per_frame=args.forward_backbone_per_frame,
+                    empty_cache_every=args.empty_cache_every,
                 )
             scheduler.step(va_dice)
 

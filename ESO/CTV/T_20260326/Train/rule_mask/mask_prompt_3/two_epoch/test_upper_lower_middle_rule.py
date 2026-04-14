@@ -44,11 +44,11 @@ from sam2.build_sam import build_sam2_video_predictor
 
 
 # ================= Default Paths (edit here) =================
-DEFAULT_TEST_ROOT = Path("/home/wusi/SAM2/SAM2data/Eso/20260326/datanii/test_nii")
-DEFAULT_OUTPUT_ROOT = Path("/home/wusi/SAM2/SAM2data/Eso/20260326/Train/rule_mask/mask_prompt_3/two_epoch/TestResult")
+DEFAULT_TEST_ROOT = Path("/home/intern/ftp/wusi/SAM2/SAM2data/Eso/20260326/datanii/test_nii")
+DEFAULT_OUTPUT_ROOT = Path("/home/intern/ftp/wusi/SAM2/SAM2data/Eso/20260326/Train/rule_mask/mask_prompt_3/two_epoch/TestResult")
 DEFAULT_MODEL_CFG = "configs/sam2.1/sam2.1_hiera_l.yaml"
-DEFAULT_FINETUNED_CKPT = Path("/home/wusi/SAM2/SAM2data/Eso/20260326/Train/rule_mask/mask_prompt_3/two_epoch/TrainResult/fold_0/checkpoints/best.pth")
-DEFAULT_TRAIN_OUTPUT_ROOT = Path("/home/wusi/SAM2/SAM2data/Eso/20260326/Train/rule_mask/mask_prompt_3/two_epoch/TrainResult")
+DEFAULT_FINETUNED_CKPT = Path("/home/intern/ftp/wusi/SAM2/SAM2data/Eso/20260326/Train/rule_mask/mask_prompt_3/two_epoch/TrainResult/fold_0/checkpoints/best.pth")
+DEFAULT_TRAIN_OUTPUT_ROOT = Path("/home/intern/ftp/wusi/SAM2/SAM2data/Eso/20260326/Train/rule_mask/mask_prompt_3/two_epoch/TrainResult")
 
 
 def window_to_uint8(img2d: np.ndarray, wc: float, ww: float) -> np.ndarray:
