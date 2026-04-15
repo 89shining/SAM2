@@ -546,6 +546,9 @@ def run_epoch_two_pass(
     core_model = unwrap_model(model)
 
     for batch_idx, batch in enumerate(loader, start=1):
+        if train_mode:
+            # Free previous step gradients before forward to reduce peak memory.
+            optimizer.zero_grad(set_to_none=True)
         batch = batch.to(device, non_blocking=True)
         base_backbone_out = _precompute_backbone_out(
             core_model,
@@ -625,7 +628,6 @@ def run_epoch_two_pass(
             loss = stage1_loss_weight * loss_stage1 + stage2_loss_weight * loss_stage2
 
         if train_mode:
-            optimizer.zero_grad(set_to_none=True)
             scaler.scale(loss).backward()
             scaler.step(optimizer)
             scaler.update()
@@ -635,6 +637,10 @@ def run_epoch_two_pass(
         n_batch += 1
 
         core_model.set_middle_prompt_enabled(False)
+        # Release large per-batch references as early as possible.
+        del outputs_stage2, output_dict_stage2, backbone_stage2
+        del backbone_stage1, output_dict_stage1, base_backbone_out
+        del loss_stage2, loss_stage1, loss
         if (
             empty_cache_every > 0
             and device.type == "cuda"

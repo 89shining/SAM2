@@ -525,7 +525,9 @@ def _clone_backbone_out(backbone_out: dict) -> dict:
     return {k: v for k, v in backbone_out.items()}
 
 
-def _precompute_backbone_out(core_model, batch):
+def _precompute_backbone_out(core_model, batch, forward_backbone_per_frame: bool = False):
+    if forward_backbone_per_frame:
+        return {"backbone_fpn": None, "vision_pos_enc": None}
     if core_model.training or not core_model.forward_backbone_per_frame_for_eval:
         return core_model.forward_image(batch.flat_img_batch)
     return {"backbone_fpn": None, "vision_pos_enc": None}
@@ -689,6 +691,8 @@ def run_epoch_two_pass(
     stage1_loss_weight: float,
     stage2_loss_weight: float,
     two_pass_mode: str,
+    forward_backbone_per_frame: bool = False,
+    empty_cache_every: int = 0,
 ):
     model.train(train_mode)
     total_loss = 0.0
@@ -697,9 +701,16 @@ def run_epoch_two_pass(
 
     core_model = unwrap_model(model)
 
-    for batch in loader:
+    for batch_idx, batch in enumerate(loader, start=1):
+        if train_mode:
+            # Free previous step gradients before forward to reduce peak memory.
+            optimizer.zero_grad(set_to_none=True)
         batch = batch.to(device, non_blocking=True)
-        base_backbone_out = _precompute_backbone_out(core_model, batch)
+        base_backbone_out = _precompute_backbone_out(
+            core_model,
+            batch,
+            forward_backbone_per_frame=forward_backbone_per_frame,
+        )
 
         # -------------------------
         # Pass-1: boundary only
@@ -785,7 +796,6 @@ def run_epoch_two_pass(
             loss = stage1_loss_weight * loss_stage1 + stage2_loss_weight * loss_stage2
 
         if train_mode:
-            optimizer.zero_grad(set_to_none=True)
             scaler.scale(loss).backward()
             scaler.step(optimizer)
             scaler.update()
@@ -795,6 +805,16 @@ def run_epoch_two_pass(
         n_batch += 1
 
         core_model.clear_runtime_middle_prompt_map()
+        # Release large per-batch references as early as possible.
+        del outputs_stage2, output_dict_stage2, backbone_stage2
+        del backbone_stage1, output_dict_stage1, base_backbone_out
+        del runtime_middle_map, loss_stage2, loss_stage1, loss
+        if (
+            empty_cache_every > 0
+            and device.type == "cuda"
+            and (batch_idx % empty_cache_every) == 0
+        ):
+            torch.cuda.empty_cache()
 
     if n_batch == 0:
         avg_loss, avg_dice = 0.0, 0.0
@@ -855,6 +875,17 @@ def main():
     parser.add_argument("--no-freeze-image-encoder", dest="freeze_image_encoder", action="store_false")
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--amp-dtype", type=str, default="bfloat16", choices=["bfloat16", "float16"])
+    parser.add_argument(
+        "--forward-backbone-per-frame",
+        action="store_true",
+        help="Compute image backbone features on demand per frame (lower GPU memory, slower).",
+    )
+    parser.add_argument(
+        "--empty-cache-every",
+        type=int,
+        default=0,
+        help="Call torch.cuda.empty_cache every N batches (0 disables). Useful for fragmentation OOM.",
+    )
     parser.add_argument("--stage1-loss-weight", type=float, default=0.0)
     parser.add_argument("--stage2-loss-weight", type=float, default=1.0)
     parser.add_argument(
@@ -1067,6 +1098,8 @@ def main():
                 stage1_loss_weight=args.stage1_loss_weight,
                 stage2_loss_weight=args.stage2_loss_weight,
                 two_pass_mode=args.two_pass_mode,
+                forward_backbone_per_frame=args.forward_backbone_per_frame,
+                empty_cache_every=args.empty_cache_every,
             )
 
             with torch.no_grad():
@@ -1082,6 +1115,8 @@ def main():
                     stage1_loss_weight=args.stage1_loss_weight,
                     stage2_loss_weight=args.stage2_loss_weight,
                     two_pass_mode=args.two_pass_mode,
+                    forward_backbone_per_frame=args.forward_backbone_per_frame,
+                    empty_cache_every=args.empty_cache_every,
                 )
 
             scheduler.step(va_dice)
