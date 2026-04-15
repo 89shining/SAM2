@@ -24,6 +24,7 @@ import SimpleITK as sitk
 import torch
 import torch.nn.functional as F
 import torch.distributed as dist
+from torch.distributed.elastic.multiprocessing.errors import record
 from hydra import compose, initialize_config_module
 from hydra.utils import instantiate
 from hydra.core.global_hydra import GlobalHydra
@@ -63,11 +64,11 @@ from training.utils.data_utils import Frame, Object, VideoDatapoint, collate_fn
 
 
 # ================= Default Paths (edit here) =================
-DEFAULT_TRAIN_ROOT = Path("/home/intern/ftp/wusi/SAM2/SAM2data/Eso/20260326/datanii/train_nii")
-DEFAULT_PROMPT3_XLSX = Path("/home/intern/ftp/wusi/SAM2/SAM2data/Eso/20260326/zero-shot/oracle_mask/mask_prompt_3/prompt_layer_search3.xlsx")
-DEFAULT_OUTPUT_ROOT = Path("/home/intern/ftp/wusi/SAM2/SAM2data/Eso/20260326/Train/oracle_mask/mask_prompt_3/two_epoch/TrainResult")
+DEFAULT_TRAIN_ROOT = Path("/home/wusi/SAM2/SAM2data/Eso/20260326/datanii/train_nii")
+DEFAULT_PROMPT3_XLSX = Path("/home/wusi/SAM2/SAM2data/Eso/20260326/zero-shot/oracle_mask/mask_prompt_3/prompt_layer_search3.xlsx")
+DEFAULT_OUTPUT_ROOT = Path("/home/wusi/SAM2/SAM2data/Eso/20260326/Train/oracle_mask/mask_prompt_3/two_epoch/TrainResult")
 DEFAULT_MODEL_CFG = "configs/sam2.1/sam2.1_hiera_l.yaml"
-DEFAULT_PRETRAINED_CKPT = Path("/home/intern/ftp/wusi/SAM2/checkpoints/sam2.1_hiera_large.pt")
+DEFAULT_PRETRAINED_CKPT = Path("/home/wusi/SAM2/checkpoints/sam2.1_hiera_large.pt")
 
 
 def set_seed(seed: int):
@@ -380,6 +381,14 @@ def reduce_scalar(value: float, device: torch.device) -> float:
     dist.all_reduce(t, op=dist.ReduceOp.SUM)
     t /= dist.get_world_size()
     return float(t.item())
+
+
+def _cleanup_ddp():
+    if dist.is_available() and dist.is_initialized():
+        try:
+            dist.destroy_process_group()
+        except Exception as e:
+            print(f"[WARN] destroy_process_group failed: {e}")
 
 
 def configure_cuda_allocator(
@@ -701,6 +710,7 @@ def make_folds(patient_dirs, num_folds: int, seed: int):
     return out
 
 
+@record
 def main():
     parser = argparse.ArgumentParser("SAM2 upper/lower->middle iterative-mask prompt finetuning")
     parser.add_argument("--train-root", type=Path, default=DEFAULT_TRAIN_ROOT, help="Directory containing train patient folders")
@@ -1100,10 +1110,11 @@ def main():
         print(f"[DONE] CV summary: {summary_csv}")
         print(f"[DONE] Best fold: {best_fold['fold']} | val_dice={best_fold['best_val_dice']:.4f}")
 
-    if use_ddp:
-        dist.barrier()
-        dist.destroy_process_group()
+    _cleanup_ddp()
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    finally:
+        _cleanup_ddp()

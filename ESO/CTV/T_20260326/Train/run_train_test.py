@@ -1,17 +1,6 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 
-"""
-nohup bash -lc '
-export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
-CUDA_VISIBLE_DEVICES=0 python -u run_train_test.py
-' > run_train_test.log 2>&1 &
-echo $!
-
-tail -f run_train_test.log
-
-"""
-
 import argparse
 import json
 import os
@@ -100,29 +89,6 @@ def main() -> None:
         default=None,
         help="Force start from step index (1-based). Overrides saved state if provided.",
     )
-    parser.add_argument(
-        "--train-empty-cache-every",
-        type=int,
-        default=0,
-        help="Pass --empty-cache-every to each TRAIN script (0 disables).",
-    )
-    parser.add_argument(
-        "--cuda-alloc-max-split-mb",
-        type=int,
-        default=128,
-        help="Pass --cuda-alloc-max-split-mb to each TRAIN script (0 disables).",
-    )
-    parser.add_argument(
-        "--cuda-alloc-gc-threshold",
-        type=float,
-        default=0.8,
-        help="Pass --cuda-alloc-gc-threshold to each TRAIN script (<=0 disables).",
-    )
-    parser.add_argument(
-        "--no-cuda-alloc-expandable-segments",
-        action="store_true",
-        help="Pass --no-cuda-alloc-expandable-segments to each TRAIN script.",
-    )
     args = parser.parse_args()
 
     script_dir = Path(__file__).resolve().parent
@@ -138,21 +104,6 @@ def main() -> None:
 
     state_path = args.state_file if args.state_file is not None else (train_root / "run_train_test_state.json")
 
-    train_common_args = [
-        "--resume",
-        "--two-pass-mode",
-        "iterative",
-        "--forward-backbone-per-frame",
-        "--empty-cache-every",
-        str(args.train_empty_cache_every),
-        "--cuda-alloc-max-split-mb",
-        str(args.cuda_alloc_max_split_mb),
-        "--cuda-alloc-gc-threshold",
-        str(args.cuda_alloc_gc_threshold),
-    ]
-    if args.no_cuda_alloc_expandable_segments:
-        train_common_args.append("--no-cuda-alloc-expandable-segments")
-
     # Order required by user: hd95 -> oracle -> middle(rule middle)
     steps = [
         (
@@ -163,7 +114,7 @@ def main() -> None:
             / "two_epoch"
             / "train_upper_lower_online_hd95_middle_cv.py",
             True,
-            list(train_common_args),
+            ["--resume", "--two-pass-mode", "iterative"],
         ),
         (
             "1) hd95 TEST",
@@ -183,7 +134,7 @@ def main() -> None:
             / "two_epoch"
             / "train_upper_lower_middle_cv_two_epoch.py",
             True,
-            list(train_common_args),
+            ["--resume", "--two-pass-mode", "iterative"],
         ),
         (
             "2) oracle TEST",
@@ -203,7 +154,7 @@ def main() -> None:
             / "two_epoch"
             / "train_upper_lower_middle_rule_cv.py",
             True,
-            list(train_common_args),
+            ["--resume", "--two-pass-mode", "iterative"],
         ),
         (
             "3) middle(rule) TEST",
