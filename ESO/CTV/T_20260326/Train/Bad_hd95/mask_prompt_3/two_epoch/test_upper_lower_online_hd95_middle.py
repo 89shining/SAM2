@@ -113,15 +113,15 @@ def safe_hd95_2d(pred2d: np.ndarray, gt2d: np.ndarray) -> float:
     pred2d = pred2d.astype(bool)
     gt2d = gt2d.astype(bool)
 
-    if pred2d.sum() == 0 and gt2d.sum() == 0:
-        return -1.0
+    # Keep selection behavior aligned with training:
+    # if either side is empty, treat slice as invalid for HD95 ranking.
     if pred2d.sum() == 0 or gt2d.sum() == 0:
-        return 1e6
+        return -1.0
 
     try:
         return float(medpy_hd95(pred2d, gt2d, voxelspacing=(1.0, 1.0)))
     except Exception:
-        return 1e6
+        return -1.0
 
 
 def select_middle_from_first_pass_hd95(pred_zyx: np.ndarray, gt_zyx: np.ndarray, lower_id: int, upper_id: int) -> int:
@@ -129,16 +129,16 @@ def select_middle_from_first_pass_hd95(pred_zyx: np.ndarray, gt_zyx: np.ndarray,
     if len(candidate_slices) == 0:
         return int(lower_id)
 
-    best_slice = candidate_slices[0]
-    worst_score = -1.0
+    valid_scores = []
 
     for z in candidate_slices:
         score = safe_hd95_2d(pred_zyx[z], gt_zyx[z])
-        if score > worst_score:
-            worst_score = score
-            best_slice = z
+        if score >= 0:
+            valid_scores.append((z, score))
 
-    return int(best_slice)
+    if len(valid_scores) == 0:
+        return int(lower_id)
+    return int(max(valid_scores, key=lambda x: x[1])[0])
 
 
 def _propagate_to_mask(state, predictor, gt_zyx: np.ndarray, obj_id: int) -> np.ndarray:
@@ -147,7 +147,12 @@ def _propagate_to_mask(state, predictor, gt_zyx: np.ndarray, obj_id: int) -> np.
     for fidx, obj_ids, logits in predictor.propagate_in_video(state):
         for i, oid in enumerate(obj_ids):
             if int(oid) == obj_id:
-                pred[int(fidx)] = (logits[i] > 0).cpu().numpy()
+                # Align with training thresholding style:
+                # pred = (pred_masks_high_res[:, 0] > 0)
+                pred_i = logits[i]
+                if pred_i.ndim == 3 and pred_i.shape[0] == 1:
+                    pred_i = pred_i[0]
+                pred[int(fidx)] = (pred_i > 0).detach().cpu().numpy().astype(np.uint8)
                 break
     return pred
 
@@ -165,9 +170,7 @@ def infer_with_boundary_then_online_hd95_middle(
     # Pass-1: boundary only
     state = predictor.init_state(video_path=str(frame_dir))
     predictor.reset_state(state)
-    boundary_ids = [int(upper_id)]
-    if int(lower_id) != int(upper_id):
-        boundary_ids.append(int(lower_id))
+    boundary_ids = sorted(set([int(lower_id), int(upper_id)]))
 
     for sid in boundary_ids:
         prompt_mask = (gt_zyx[sid] > 0).astype(np.uint8)
@@ -207,11 +210,7 @@ def infer_with_boundary_then_online_hd95_middle(
     else:
         state = predictor.init_state(video_path=str(frame_dir))
         predictor.reset_state(state)
-        prompt_ids = [int(upper_id)]
-        if int(lower_id) != int(upper_id):
-            prompt_ids.append(int(lower_id))
-        if int(middle_id) not in prompt_ids:
-            prompt_ids.append(int(middle_id))
+        prompt_ids = sorted(set([int(lower_id), int(upper_id), int(middle_id)]))
         for sid in prompt_ids:
             prompt_mask = (gt_zyx[sid] > 0).astype(np.uint8)
             if prompt_mask.sum() == 0:
@@ -234,24 +233,25 @@ def patient_id_from_folder(pdir: Path):
     return f"CTV_{int(m.group()):03d}"
 
 
-def resolve_ckpt(finetuned_ckpt: Path, train_output_root: Path) -> Path:
+def resolve_ckpt(finetuned_ckpt: Path, train_output_root: Path, auto_best_fold: bool = True) -> Path:
     """
     Priority:
-    1) explicit --finetuned-ckpt if exists
-    2) best fold from best_fold.txt under train_output_root
+    1) when auto_best_fold=True, best fold from best_fold.txt under train_output_root
+    2) explicit --finetuned-ckpt if exists
     3) DEFAULT_FINETUNED_CKPT
     """
+    if auto_best_fold:
+        best_fold_txt = train_output_root / "best_fold.txt"
+        if best_fold_txt.exists():
+            content = best_fold_txt.read_text(encoding="utf-8", errors="ignore")
+            m = re.search(r"best_ckpt:\s*(.+)", content)
+            if m:
+                best_ckpt = Path(m.group(1).strip())
+                if best_ckpt.exists():
+                    return best_ckpt
+
     if finetuned_ckpt.exists():
         return finetuned_ckpt
-
-    best_fold_txt = train_output_root / "best_fold.txt"
-    if best_fold_txt.exists():
-        content = best_fold_txt.read_text(encoding="utf-8", errors="ignore")
-        m = re.search(r"best_ckpt:\s*(.+)", content)
-        if m:
-            best_ckpt = Path(m.group(1).strip())
-            if best_ckpt.exists():
-                return best_ckpt
 
     if DEFAULT_FINETUNED_CKPT.exists():
         return DEFAULT_FINETUNED_CKPT
@@ -277,6 +277,11 @@ def main():
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--excel-name", type=str, default="online_hd95_middle_results.xlsx")
     parser.add_argument(
+        "--no-auto-best-fold",
+        action="store_true",
+        help="Disable auto loading best_ckpt from train_output_root/best_fold.txt.",
+    )
+    parser.add_argument(
         "--two-pass-mode",
         type=str,
         default="iterative",
@@ -287,7 +292,11 @@ def main():
 
     if not args.test_root.exists():
         raise FileNotFoundError(f"test root not found: {args.test_root}")
-    ckpt_path = resolve_ckpt(args.finetuned_ckpt, args.train_output_root)
+    ckpt_path = resolve_ckpt(
+        args.finetuned_ckpt,
+        args.train_output_root,
+        auto_best_fold=(not args.no_auto_best_fold),
+    )
 
     args.output_root.mkdir(parents=True, exist_ok=True)
     best_mask_dir = args.output_root / "best_mask"

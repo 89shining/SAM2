@@ -227,36 +227,27 @@ class SAM2TrainUpperLowerDynamicMiddleMask(SAM2Train):
             upper_ids.append(upper)
             middle_ids.append(middle)
 
-        init_cond_frames = sorted(set(lower_ids + upper_ids))
+        init_cond_frames = set(lower_ids + upper_ids)
 
         if self.enable_middle_prompt:
-            middle_prompt_frames = sorted(
-                set([m for m in middle_ids if m is not None]) - set(init_cond_frames)
-            )
-            remaining_frames = [
-                t for t in range(start_frame_idx, num_frames) if t not in init_cond_frames
-            ]
-            remaining_wo_middle = [t for t in remaining_frames if t not in middle_prompt_frames]
-            backbone_out["frames_not_in_init_cond"] = middle_prompt_frames + remaining_wo_middle
-        else:
-            backbone_out["frames_not_in_init_cond"] = [
-                t for t in range(start_frame_idx, num_frames) if t not in init_cond_frames
-            ]
+            middle_valid = [m for m in middle_ids if m is not None]
+            init_cond_frames = init_cond_frames.union(set(middle_valid))
+
+        init_cond_frames = sorted(init_cond_frames)
 
         backbone_out["init_cond_frames"] = init_cond_frames
+        backbone_out["frames_not_in_init_cond"] = [
+            t for t in range(start_frame_idx, num_frames)
+            if t not in init_cond_frames
+        ]
+
         backbone_out["mask_inputs_per_frame"] = {}
-
-        if self.enable_middle_prompt:
-            prompt_frames = sorted(set(init_cond_frames + [m for m in middle_ids if m is not None]))
-        else:
-            prompt_frames = init_cond_frames
-
-        for t in prompt_frames:
+        for t in init_cond_frames:
             gt_t = gt_masks_per_frame[t]  # [O,1,H,W]
             prompt_t = torch.zeros_like(gt_t)
             for o in range(o_dim):
                 if lower_ids[o] == t or upper_ids[o] == t or (
-                    self.enable_middle_prompt and middle_ids[o] is not None and middle_ids[o] == t
+                        self.enable_middle_prompt and middle_ids[o] is not None and middle_ids[o] == t
                 ):
                     prompt_t[o] = gt_t[o]
             backbone_out["mask_inputs_per_frame"][t] = prompt_t
@@ -446,23 +437,17 @@ def _safe_hd95_2d(pred2d: np.ndarray, gt2d: np.ndarray) -> float:
     pred2d = pred2d.astype(bool)
     gt2d = gt2d.astype(bool)
 
-    if pred2d.sum() == 0 and gt2d.sum() == 0:
-        return -1.0  # skip
+    # 跳过无效slice
     if pred2d.sum() == 0 or gt2d.sum() == 0:
-        return 1e6   # strongest penalty
+        return -1.0
 
     try:
         return float(medpy_hd95(pred2d, gt2d, voxelspacing=(1.0, 1.0)))
     except Exception:
-        return 1e6
+        return -1.0
 
 
 def select_worst_hd95_middle_from_outputs(outputs, batch_masks: torch.Tensor, unique_objects_identifier):
-    """
-    outputs: list[T], each has pred_masks_high_res [O,1,H,W]
-    batch_masks: [T,O,H,W]
-    unique_objects_identifier: [T,O,3], where [...,0] is original video_id
-    """
     t_dim, o_dim = batch_masks.shape[:2]
     runtime_map = {}
 
@@ -470,9 +455,9 @@ def select_worst_hd95_middle_from_outputs(outputs, batch_masks: torch.Tensor, un
     for t in range(t_dim):
         pred_t = (outputs[t]["pred_masks_high_res"][:, 0] > 0).detach().cpu().numpy().astype(np.uint8)
         pred_vols.append(pred_t)
-    pred_vols = np.stack(pred_vols, axis=0)  # [T,O,H,W]
+    pred_vols = np.stack(pred_vols, axis=0)
 
-    gt_vols = batch_masks.detach().cpu().numpy().astype(np.uint8)  # [T,O,H,W]
+    gt_vols = batch_masks.detach().cpu().numpy().astype(np.uint8)
 
     for o in range(o_dim):
         video_id = int(unique_objects_identifier[0, o, 0].item())
@@ -488,24 +473,28 @@ def select_worst_hd95_middle_from_outputs(outputs, batch_masks: torch.Tensor, un
         lower = int(pos.min())
         upper = int(pos.max())
 
-        candidate_slices = [z for z in range(lower + 1, upper)]
+        candidate_slices = list(range(lower + 1, upper))
         if len(candidate_slices) == 0:
             runtime_map[video_id] = lower
             continue
 
-        best_slice = candidate_slices[0]
-        worst_score = -1.0
+        valid_scores = []
 
         for z in candidate_slices:
             score = _safe_hd95_2d(pred_o[z], gt_o[z])
-            if score > worst_score:
-                worst_score = score
-                best_slice = z
 
-        runtime_map[video_id] = int(best_slice)
+            # 只保留有效slice
+            if score >= 0:
+                valid_scores.append((z, score))
+
+        # 如果全是无效slice → fallback
+        if len(valid_scores) == 0:
+            runtime_map[video_id] = lower
+        else:
+            best_slice = max(valid_scores, key=lambda x: x[1])[0]
+            runtime_map[video_id] = int(best_slice)
 
     return runtime_map
-
 
 def ddp_enabled() -> bool:
     return dist.is_available() and dist.is_initialized()
@@ -764,16 +753,18 @@ def run_epoch_two_pass(
                 backbone_stage2, middle_frames = _append_middle_prompts_inplace(
                     core_model, base_backbone_out, backbone_stage1, batch
                 )
+
+                processing_order = middle_frames + [
+                    t for t in backbone_stage2["frames_not_in_init_cond"]
+                    if t not in set(middle_frames)
+                ]
+
                 output_dict_stage2 = _forward_tracking_iterative(
                     core_model,
                     backbone_stage2,
                     batch,
                     output_dict=output_dict_stage1,
-                    processing_order=middle_frames + [
-                        t
-                        for t in backbone_stage2["frames_not_in_init_cond"]
-                        if t not in set(middle_frames)
-                    ],
+                    processing_order=processing_order
                 )
             else:
                 backbone_stage2 = core_model.prepare_prompt_inputs(

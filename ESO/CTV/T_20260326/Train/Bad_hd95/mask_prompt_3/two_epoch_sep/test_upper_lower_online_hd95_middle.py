@@ -10,17 +10,21 @@ import tempfile
 from pathlib import Path
 
 import numpy as np
-import pandas as pd
 import SimpleITK as sitk
 import torch
 from openpyxl import Workbook
 from PIL import Image
+from medpy.metric.binary import hd95 as medpy_hd95
 
 # keep local import robust
 CURRENT_DIR = Path(__file__).resolve().parent
 
 
 def _find_project_root(start: Path) -> Path:
+    """
+    Find SAM2 repo root dynamically to avoid hard-coded parent depth.
+    Root must contain both `training` and `sam2` directories.
+    """
     for p in [start] + list(start.parents):
         if (p / "training").is_dir() and (p / "sam2").is_dir():
             return p
@@ -46,11 +50,12 @@ from sam2.build_sam import build_sam2_video_predictor
 
 # ================= Default Paths (edit here) =================
 DEFAULT_TEST_ROOT = Path("/home/wusi/SAM2/SAM2data/Eso/20260326/datanii/test_nii")
-DEFAULT_OUTPUT_ROOT = Path("/home/wusi/SAM2/SAM2data/Eso/20260326/Train/oracle_mask/mask_prompt_3/two_epoch/TestResult")
+DEFAULT_OUTPUT_ROOT = Path("/home/wusi/SAM2/SAM2data/Eso/20260326/Train/BadHD95_slice/mask_prompt_3/two_epoch_sep/TestResult")
 DEFAULT_MODEL_CFG = "configs/sam2.1/sam2.1_hiera_l.yaml"
-DEFAULT_FINETUNED_CKPT = Path("/home/wusi/SAM2/SAM2data/Eso/20260326/Train/oracle_mask/mask_prompt_3/two_epoch/TrainResult/fold_0/checkpoints/best.pth")
-DEFAULT_TRAIN_OUTPUT_ROOT = Path("/home/wusi/SAM2/SAM2data/Eso/20260326/Train/oracle_mask/mask_prompt_3/two_epoch/TrainResult")
-DEFAULT_PROMPT3_XLSX = Path("/home/wusi/SAM2/SAM2data/Eso/20260326/zero-shot/oracle_mask/mask_prompt_3/prompt_layer_search3.xlsx")
+DEFAULT_FINETUNED_CKPT = Path("/home/wusi/SAM2/SAM2data/Eso/20260326/Train/BadHD95_slice/mask_prompt_3/two_epoch_sep/TrainResult/fold_0/checkpoints/best.pth")
+DEFAULT_TRAIN_OUTPUT_ROOT = Path("/home/wusi/SAM2/SAM2data/Eso/20260326/Train/BadHD95_slice/mask_prompt_3/two_epoch_sep/TrainResult")
+DEFAULT_SELECTOR_TRAIN_OUTPUT_ROOT = Path("/home/wusi/SAM2/SAM2data/Eso/20260326/Train/oracle_mask/mask_prompt_2/TrainResult")
+DEFAULT_SELECTOR_CKPT = DEFAULT_SELECTOR_TRAIN_OUTPUT_ROOT / "fold_0/checkpoints/best.pth"
 
 
 def window_to_uint8(img2d: np.ndarray, wc: float, ww: float) -> np.ndarray:
@@ -106,60 +111,36 @@ def relative_pos_upper_to_lower(slice_id: int, lower_id: int, upper_id: int) -> 
     return float((upper_id - slice_id) / (upper_id - lower_id))
 
 
-def normalize_id(value) -> str:
-    if pd.isna(value):
-        return ""
-    if isinstance(value, (int, np.integer)):
-        return str(int(value)).strip()
-    if isinstance(value, (float, np.floating)):
-        if float(value).is_integer():
-            return str(int(value)).strip()
-        return str(value).strip()
-    text = str(value).strip()
-    if text.endswith(".0"):
-        numeric = text[:-2]
-        if numeric.isdigit():
-            return numeric
-    return text
+def safe_hd95_2d(pred2d: np.ndarray, gt2d: np.ndarray) -> float:
+    pred2d = pred2d.astype(bool)
+    gt2d = gt2d.astype(bool)
+
+    # Keep selection behavior aligned with training:
+    # if either side is empty, treat slice as invalid for HD95 ranking.
+    if pred2d.sum() == 0 or gt2d.sum() == 0:
+        return -1.0
+
+    try:
+        return float(medpy_hd95(pred2d, gt2d, voxelspacing=(1.0, 1.0)))
+    except Exception:
+        return -1.0
 
 
-def find_sheet_with_columns(excel_path: Path, required_columns):
-    if not excel_path.exists():
-        raise FileNotFoundError(f"Excel not found: {excel_path}")
-    sheets = pd.read_excel(excel_path, sheet_name=None)
-    for sheet_name, df in sheets.items():
-        if all(col in df.columns for col in required_columns):
-            print(f"[INFO] Using sheet '{sheet_name}' from {excel_path.name}")
-            return df.copy()
-    raise ValueError(
-        f"Cannot find required columns {list(required_columns)} in any sheet of {excel_path}"
-    )
+def select_middle_from_first_pass_hd95(pred_zyx: np.ndarray, gt_zyx: np.ndarray, lower_id: int, upper_id: int) -> int:
+    candidate_slices = list(range(lower_id + 1, upper_id))
+    if len(candidate_slices) == 0:
+        return int(lower_id)
 
+    valid_scores = []
 
-def load_middle_prompt_by_patient(prompt3_xlsx: Path):
-    df = find_sheet_with_columns(prompt3_xlsx, ["Patient_ID", "Best_Prompt_Slice_ID"])
-    df = df[["Patient_ID", "Best_Prompt_Slice_ID"]].copy()
-    df["Patient_ID"] = df["Patient_ID"].apply(normalize_id)
-    df["Best_Prompt_Slice_ID"] = df["Best_Prompt_Slice_ID"].apply(normalize_id)
-    df = df[(df["Patient_ID"] != "") & (df["Best_Prompt_Slice_ID"] != "")]
+    for z in candidate_slices:
+        score = safe_hd95_2d(pred_zyx[z], gt_zyx[z])
+        if score >= 0:
+            valid_scores.append((z, score))
 
-    out = {}
-    for _, row in df.iterrows():
-        pid = str(row["Patient_ID"])
-        try:
-            mid = int(float(row["Best_Prompt_Slice_ID"]))
-        except Exception as exc:
-            raise ValueError(f"Invalid Best_Prompt_Slice_ID row: {row.to_dict()}") from exc
-
-        if pid in out and out[pid] != mid:
-            raise ValueError(f"Duplicate patient with conflicting middle id: {pid} -> {out[pid]} vs {mid}")
-        out[pid] = mid
-
-    if len(out) == 0:
-        raise ValueError(f"No valid middle prompts loaded from: {prompt3_xlsx}")
-
-    print(f"[INFO] Loaded middle prompts for {len(out)} patients")
-    return out
+    if len(valid_scores) == 0:
+        return int(lower_id)
+    return int(max(valid_scores, key=lambda x: x[1])[0])
 
 
 def _propagate_to_mask(state, predictor, gt_zyx: np.ndarray, obj_id: int) -> np.ndarray:
@@ -168,77 +149,94 @@ def _propagate_to_mask(state, predictor, gt_zyx: np.ndarray, obj_id: int) -> np.
     for fidx, obj_ids, logits in predictor.propagate_in_video(state):
         for i, oid in enumerate(obj_ids):
             if int(oid) == obj_id:
-                pred[int(fidx)] = (logits[i] > 0).cpu().numpy()
+                # Align with training thresholding style:
+                # pred = (pred_masks_high_res[:, 0] > 0)
+                pred_i = logits[i]
+                if pred_i.ndim == 3 and pred_i.shape[0] == 1:
+                    pred_i = pred_i[0]
+                pred[int(fidx)] = (pred_i > 0).detach().cpu().numpy().astype(np.uint8)
                 break
     return pred
 
 
 @torch.no_grad()
-def infer_with_iterative_three_prompt_slices(
+def infer_with_boundary_then_online_hd95_middle(
     predictor,
+    selector_predictor,
     frame_dir: Path,
     gt_zyx: np.ndarray,
     lower_id: int,
     upper_id: int,
-    middle_id: int,
     obj_id: int,
     two_pass_mode: str = "iterative",
+    stage2_model: str = "selector",
 ):
-    # Stage-1: upper/lower prompts
-    state = predictor.init_state(video_path=str(frame_dir))
-    predictor.reset_state(state)
-    boundary_ids = [int(upper_id)]
-    if int(lower_id) != int(upper_id):
-        boundary_ids.append(int(lower_id))
+    boundary_ids = sorted(set([int(lower_id), int(upper_id)]))
+
+    # Pass-1 for selector (fixed 2-prompt model): only used to choose middle slice.
+    selector_state = selector_predictor.init_state(video_path=str(frame_dir))
+    selector_predictor.reset_state(selector_state)
     for sid in boundary_ids:
         prompt_mask = (gt_zyx[sid] > 0).astype(np.uint8)
         if prompt_mask.sum() == 0:
             raise RuntimeError(f"Prompt slice {sid} is empty in GT.")
-        predictor.add_new_mask(
-            inference_state=state,
+        selector_predictor.add_new_mask(
+            inference_state=selector_state,
             frame_idx=sid,
             obj_id=obj_id,
             mask=prompt_mask,
         )
+    selector_pred_stage1 = _propagate_to_mask(selector_state, selector_predictor, gt_zyx, obj_id)
 
-    pred_stage1 = _propagate_to_mask(state, predictor, gt_zyx, obj_id)
+    # Select middle from selector pass-1 prediction.
+    middle_id = select_middle_from_first_pass_hd95(
+        pred_zyx=selector_pred_stage1,
+        gt_zyx=gt_zyx,
+        lower_id=lower_id,
+        upper_id=upper_id,
+    )
 
-    # Stage-2:
-    # - iterative: continue from stage-1 state and add middle only
+    # Report stage1 from the fixed selector pass-1.
+    pred_stage1 = selector_pred_stage1
+
+    # Pass-2:
+    # - iterative: continue from selector pass-1 state/memory and add middle only
     # - independent: re-init and feed upper/lower/middle together
     if two_pass_mode == "iterative":
-        mid = int(middle_id)
-        if mid not in boundary_ids:
-            mid_mask = (gt_zyx[mid] > 0).astype(np.uint8)
+        if stage2_model == "selector":
+            state = selector_state
+            active_predictor = selector_predictor
+        else:
+            state = selector_state
+            active_predictor = predictor
+        if middle_id not in boundary_ids:
+            mid_mask = (gt_zyx[middle_id] > 0).astype(np.uint8)
             if mid_mask.sum() == 0:
-                raise RuntimeError(f"Prompt slice {mid} is empty in GT.")
-            predictor.add_new_mask(
+                raise RuntimeError(f"Prompt slice {middle_id} is empty in GT.")
+            active_predictor.add_new_mask(
                 inference_state=state,
-                frame_idx=mid,
+                frame_idx=middle_id,
                 obj_id=obj_id,
                 mask=mid_mask,
             )
     else:
-        state = predictor.init_state(video_path=str(frame_dir))
-        predictor.reset_state(state)
-        prompt_ids = [int(upper_id)]
-        if int(lower_id) != int(upper_id):
-            prompt_ids.append(int(lower_id))
-        if int(middle_id) not in prompt_ids:
-            prompt_ids.append(int(middle_id))
+        active_predictor = selector_predictor if stage2_model == "selector" else predictor
+        state = active_predictor.init_state(video_path=str(frame_dir))
+        active_predictor.reset_state(state)
+        prompt_ids = sorted(set([int(lower_id), int(upper_id), int(middle_id)]))
         for sid in prompt_ids:
             prompt_mask = (gt_zyx[sid] > 0).astype(np.uint8)
             if prompt_mask.sum() == 0:
                 raise RuntimeError(f"Prompt slice {sid} is empty in GT.")
-            predictor.add_new_mask(
+            active_predictor.add_new_mask(
                 inference_state=state,
                 frame_idx=sid,
                 obj_id=obj_id,
                 mask=prompt_mask,
             )
 
-    pred_stage2 = _propagate_to_mask(state, predictor, gt_zyx, obj_id)
-    return pred_stage1, pred_stage2
+    pred_stage2 = _propagate_to_mask(state, active_predictor, gt_zyx, obj_id)
+    return pred_stage1, pred_stage2, middle_id
 
 
 def patient_id_from_folder(pdir: Path):
@@ -248,42 +246,43 @@ def patient_id_from_folder(pdir: Path):
     return f"CTV_{int(m.group()):03d}"
 
 
-def resolve_ckpt(finetuned_ckpt: Path, train_output_root: Path) -> Path:
+def resolve_ckpt(ckpt: Path, train_output_root: Path, default_ckpt: Path, auto_best_fold: bool = True) -> Path:
     """
     Priority:
-    1) explicit --finetuned-ckpt if exists
-    2) best fold from best_fold.txt under train_output_root
-    3) DEFAULT_FINETUNED_CKPT
+    1) when auto_best_fold=True, best fold from best_fold.txt under train_output_root
+    2) explicit ckpt if exists
+    3) default_ckpt
     """
-    if finetuned_ckpt.exists():
-        return finetuned_ckpt
+    if auto_best_fold:
+        best_fold_txt = train_output_root / "best_fold.txt"
+        if best_fold_txt.exists():
+            content = best_fold_txt.read_text(encoding="utf-8", errors="ignore")
+            m = re.search(r"best_ckpt:\s*(.+)", content)
+            if m:
+                best_ckpt = Path(m.group(1).strip())
+                if best_ckpt.exists():
+                    return best_ckpt
 
-    best_fold_txt = train_output_root / "best_fold.txt"
-    if best_fold_txt.exists():
-        content = best_fold_txt.read_text(encoding="utf-8", errors="ignore")
-        m = re.search(r"best_ckpt:\s*(.+)", content)
-        if m:
-            best_ckpt = Path(m.group(1).strip())
-            if best_ckpt.exists():
-                return best_ckpt
+    if ckpt.exists():
+        return ckpt
 
-    if DEFAULT_FINETUNED_CKPT.exists():
-        return DEFAULT_FINETUNED_CKPT
+    if default_ckpt.exists():
+        return default_ckpt
 
     raise FileNotFoundError(
         "No usable finetuned checkpoint found. "
-        f"Tried: {finetuned_ckpt}, best_fold.txt in {train_output_root}, {DEFAULT_FINETUNED_CKPT}"
+        f"Tried: {ckpt}, best_fold.txt in {train_output_root}, {default_ckpt}"
     )
 
 
 def main():
-    parser = argparse.ArgumentParser("Test SAM2 with iterative upper/lower->middle mask prompts")
+    parser = argparse.ArgumentParser("Test SAM2 with upper/lower -> online worst-HD95 middle prompts")
     parser.add_argument("--test-root", type=Path, default=DEFAULT_TEST_ROOT, help="Separate test set root")
     parser.add_argument("--output-root", type=Path, default=DEFAULT_OUTPUT_ROOT, help="Save root for masks/excel")
     parser.add_argument("--finetuned-ckpt", type=Path, default=DEFAULT_FINETUNED_CKPT, help="Checkpoint for inference")
     parser.add_argument("--train-output-root", type=Path, default=DEFAULT_TRAIN_OUTPUT_ROOT, help="Training output root for auto resolving best fold ckpt")
-    parser.add_argument("--prompt3-xlsx", type=Path, default=DEFAULT_PROMPT3_XLSX, help="mask_prompt_3 output excel with Best_Prompt_Slice_ID")
-    parser.add_argument("--allow-missing-middle", action="store_true", help="Skip patients missing middle prompt in excel")
+    parser.add_argument("--selector-ckpt", type=Path, default=DEFAULT_SELECTOR_CKPT, help="Fixed selector checkpoint for middle-slice selection")
+    parser.add_argument("--selector-train-output-root", type=Path, default=DEFAULT_SELECTOR_TRAIN_OUTPUT_ROOT, help="Selector training output root for auto resolving best fold ckpt")
     parser.add_argument("--model-cfg", type=str, default=DEFAULT_MODEL_CFG)
     parser.add_argument("--img-name", type=str, default="image.nii.gz")
     parser.add_argument("--gt-name", type=str, default="CTV.nii.gz")
@@ -291,7 +290,17 @@ def main():
     parser.add_argument("--window-center", type=float, default=40.0)
     parser.add_argument("--window-width", type=float, default=400.0)
     parser.add_argument("--device", type=str, default="cuda")
-    parser.add_argument("--excel-name", type=str, default="prompt_layer_search3.xlsx")
+    parser.add_argument("--excel-name", type=str, default="online_hd95_middle_results.xlsx")
+    parser.add_argument(
+        "--no-auto-best-fold",
+        action="store_true",
+        help="Disable auto loading best_ckpt from train_output_root/best_fold.txt.",
+    )
+    parser.add_argument(
+        "--selector-no-auto-best-fold",
+        action="store_true",
+        help="Disable auto loading selector best_ckpt from selector_train_output_root/best_fold.txt.",
+    )
     parser.add_argument(
         "--two-pass-mode",
         type=str,
@@ -299,13 +308,29 @@ def main():
         choices=["iterative", "independent"],
         help="iterative: stage2 continues on stage1 state; independent: re-init and feed 3 prompts",
     )
+    parser.add_argument(
+        "--stage2-model",
+        type=str,
+        default="main",
+        choices=["selector", "main"],
+        help="Model used in pass-2. In iterative mode, both options reuse selector pass-1 memory.",
+    )
     args = parser.parse_args()
 
     if not args.test_root.exists():
         raise FileNotFoundError(f"test root not found: {args.test_root}")
-    ckpt_path = resolve_ckpt(args.finetuned_ckpt, args.train_output_root)
-
-    middle_prompt_by_patient = load_middle_prompt_by_patient(args.prompt3_xlsx)
+    ckpt_path = resolve_ckpt(
+        ckpt=args.finetuned_ckpt,
+        train_output_root=args.train_output_root,
+        default_ckpt=DEFAULT_FINETUNED_CKPT,
+        auto_best_fold=(not args.no_auto_best_fold),
+    )
+    selector_ckpt_path = resolve_ckpt(
+        ckpt=args.selector_ckpt,
+        train_output_root=args.selector_train_output_root,
+        default_ckpt=DEFAULT_SELECTOR_CKPT,
+        auto_best_fold=(not args.selector_no_auto_best_fold),
+    )
 
     args.output_root.mkdir(parents=True, exist_ok=True)
     best_mask_dir = args.output_root / "best_mask"
@@ -320,7 +345,13 @@ def main():
         str(ckpt_path),
         device=device,
     )
+    selector_predictor = build_sam2_video_predictor(
+        args.model_cfg,
+        str(selector_ckpt_path),
+        device=device,
+    )
     print(f"[INFO] Using checkpoint: {ckpt_path}")
+    print(f"[INFO] Using selector checkpoint: {selector_ckpt_path}")
 
     patient_dirs = sorted([p for p in args.test_root.iterdir() if p.is_dir()])
     print(f"[INFO] Found {len(patient_dirs)} patients")
@@ -337,13 +368,6 @@ def main():
             print(f"[WARN] Skip {pdir.name}: missing image or GT")
             continue
 
-        if patient_id not in middle_prompt_by_patient:
-            msg = f"[WARN] Skip {pdir.name}: missing Best_Prompt_Slice_ID for {patient_id}"
-            if args.allow_missing_middle:
-                print(msg)
-                continue
-            raise KeyError(msg)
-
         img_zyx, img_sitk = read_nii_zyx(img_path)
         gt_zyx, _ = read_nii_zyx(gt_path)
         gt_zyx = (gt_zyx > 0).astype(np.uint8)
@@ -359,42 +383,30 @@ def main():
 
         lower_id = int(min(pos))
         upper_id = int(max(pos))
-        middle_id = int(middle_prompt_by_patient[patient_id])
-
-        # Clamp to valid range, then ensure non-empty GT on prompt slice.
-        middle_id = max(0, min(middle_id, int(gt_zyx.shape[0]) - 1))
-        if int((gt_zyx[middle_id] > 0).sum()) == 0:
-            middle_candidates = [z for z in pos if lower_id < z < upper_id]
-            if len(middle_candidates) > 0:
-                middle_candidates = sorted(middle_candidates)
-                middle_id = int(middle_candidates[len(middle_candidates) // 2])
-            else:
-                middle_id = int(lower_id)
-
-        rel = relative_pos_upper_to_lower(middle_id, lower_id, upper_id)
-        print(
-            f"[INFO] {patient_id} | fixed prompts: upper={upper_id}, lower={lower_id}, middle={middle_id}"
-        )
 
         tmp_dir = Path(tempfile.mkdtemp(prefix=f"sam2_test_{pdir.name}_"))
         try:
             save_frames_from_volume(img_zyx, tmp_dir, args.window_center, args.window_width)
-            pred_stage1, pred_stage2 = infer_with_iterative_three_prompt_slices(
+            pred_stage1, pred_stage2, middle_id = infer_with_boundary_then_online_hd95_middle(
                 predictor=predictor,
+                selector_predictor=selector_predictor,
                 frame_dir=tmp_dir,
                 gt_zyx=gt_zyx,
                 lower_id=lower_id,
                 upper_id=upper_id,
-                middle_id=middle_id,
                 obj_id=args.obj_id,
                 two_pass_mode=args.two_pass_mode,
+                stage2_model=args.stage2_model,
             )
             dice_stage1 = dice_3d(pred_stage1, gt_zyx)
             dice_stage2 = dice_3d(pred_stage2, gt_zyx)
+
+            rel = relative_pos_upper_to_lower(middle_id, lower_id, upper_id)
             write_mask_like(pred_stage2, img_sitk, out_mask_path)
+
             print(
                 f"[OK] {patient_id}: stage1_dice={dice_stage1:.4f}, "
-                f"stage2_dice={dice_stage2:.4f} -> {out_mask_path}"
+                f"stage2_dice={dice_stage2:.4f}, middle={middle_id} -> {out_mask_path}"
             )
 
             all_rows.append(
@@ -417,7 +429,6 @@ def main():
         return int(mm.group(1)) if mm else 10**9
 
     all_rows.sort(key=_pid_key)
-    
 
     wb = Workbook()
     ws_all = wb.active
