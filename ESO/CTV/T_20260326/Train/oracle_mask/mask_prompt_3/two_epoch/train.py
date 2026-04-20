@@ -1,10 +1,10 @@
 ﻿#!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
-SAM2 finetuning with true two-pass prompting:
-  pass-1: upper + lower mask prompts only
-  select middle slice online from pass-1 prediction using worst 2D HD95
-  pass-2: upper + lower + selected middle mask prompt
+SAM2 finetuning with iterative two-stage prompting (oracle middle):
+  pass-1: upper + lower prompts
+  middle slice: from oracle prompt table (same source as oracle_mask/mask_prompt_3/one_epoch)
+  pass-2: continue from pass-1 memory and inject middle prompt
 
 Example:
 CUDA_VISIBLE_DEVICES=0,1 torchrun --nproc_per_node=2 train_upper_lower_online_hd95_middle_cv.py
@@ -17,9 +17,11 @@ import os
 import random
 import re
 import sys
+from contextlib import nullcontext
 from pathlib import Path
 
 import numpy as np
+import pandas as pd
 import SimpleITK as sitk
 import torch
 import torch.nn.functional as F
@@ -67,13 +69,8 @@ from training.loss_fns import MultiStepMultiMasksAndIous
 from training.utils.data_utils import Frame, Object, VideoDatapoint, collate_fn
 
 
-# ================= Default Paths (edit here) =================
-DEFAULT_TRAIN_ROOT = Path("/home/wusi/SAM2/SAM2data/Eso/20260326/datanii/train_nii")
-DEFAULT_OUTPUT_ROOT = Path("/home/wusi/SAM2/SAM2data/Eso/20260326/Train/BadHD95_slice/mask_prompt_3/two_epoch_sep/TrainResult")
+# ================= Defaults =================
 DEFAULT_MODEL_CFG = "configs/sam2.1/sam2.1_hiera_l.yaml"
-DEFAULT_PRETRAINED_CKPT = Path("/home/wusi/SAM2/checkpoints/sam2.1_hiera_large.pt")
-DEFAULT_SELECTOR_TRAIN_OUTPUT_ROOT = Path("/home/wusi/SAM2/SAM2data/Eso/20260326/Train/oracle_mask/mask_prompt_2/TrainResult")
-DEFAULT_SELECTOR_CKPT = DEFAULT_SELECTOR_TRAIN_OUTPUT_ROOT / "fold_0/checkpoints/best.pth"
 
 
 def set_seed(seed: int):
@@ -393,26 +390,6 @@ def build_model(
     return model
 
 
-def resolve_ckpt(pretrained_ckpt: Path, train_output_root: Path, default_ckpt: Path, auto_best_fold: bool = True) -> Path:
-    if auto_best_fold:
-        best_fold_txt = train_output_root / "best_fold.txt"
-        if best_fold_txt.exists():
-            content = best_fold_txt.read_text(encoding="utf-8", errors="ignore")
-            m = re.search(r"best_ckpt:\s*(.+)", content)
-            if m:
-                best_ckpt = Path(m.group(1).strip())
-                if best_ckpt.exists():
-                    return best_ckpt
-    if pretrained_ckpt.exists():
-        return pretrained_ckpt
-    if default_ckpt.exists():
-        return default_ckpt
-    raise FileNotFoundError(
-        "No usable checkpoint found. "
-        f"Tried: {pretrained_ckpt}, best_fold.txt in {train_output_root}, {default_ckpt}"
-    )
-
-
 def build_optimizer(model, base_lr: float, vision_lr: float, weight_decay: float):
     image_encoder_params = []
     other_params = []
@@ -468,24 +445,106 @@ def _safe_hd95_2d(pred2d: np.ndarray, gt2d: np.ndarray) -> float:
         return -1.0
 
 
-def select_worst_hd95_middle_from_outputs(outputs, batch_masks: torch.Tensor, unique_objects_identifier):
+def normalize_id(value) -> str:
+    if pd.isna(value):
+        return ""
+    if isinstance(value, (int, np.integer)):
+        return str(int(value)).strip()
+    if isinstance(value, (float, np.floating)):
+        if float(value).is_integer():
+            return str(int(value)).strip()
+        return str(value).strip()
+    text = str(value).strip()
+    if text.endswith(".0"):
+        numeric = text[:-2]
+        if numeric.isdigit():
+            return numeric
+    return text
+
+
+def find_sheet_with_columns(excel_path: Path, required_columns):
+    if not excel_path.exists():
+        raise FileNotFoundError(f"Excel not found: {excel_path}")
+    sheets = pd.read_excel(excel_path, sheet_name=None)
+    for sheet_name, df in sheets.items():
+        if all(col in df.columns for col in required_columns):
+            print(f"[INFO] Using sheet '{sheet_name}' from {excel_path.name}")
+            return df.copy()
+    raise ValueError(
+        f"Cannot find required columns {list(required_columns)} in any sheet of {excel_path}"
+    )
+
+
+def load_middle_prompt_map(prompt3_xlsx: Path):
+    df = find_sheet_with_columns(prompt3_xlsx, ["Patient_ID", "Best_Prompt_Slice_ID"])
+    df = df[["Patient_ID", "Best_Prompt_Slice_ID"]].copy()
+    df["Patient_ID"] = df["Patient_ID"].apply(normalize_id)
+    df["Best_Prompt_Slice_ID"] = df["Best_Prompt_Slice_ID"].apply(normalize_id)
+    df = df[(df["Patient_ID"] != "") & (df["Best_Prompt_Slice_ID"] != "")]
+
+    prompt_map = {}
+    for _, row in df.iterrows():
+        pid = str(row["Patient_ID"])
+        try:
+            mid = int(float(row["Best_Prompt_Slice_ID"]))
+        except Exception as exc:
+            raise ValueError(f"Invalid Best_Prompt_Slice_ID row: {row.to_dict()}") from exc
+
+        try:
+            video_id = patient_video_num_from_id(pid)
+        except Exception:
+            m = re.search(r"(\d+)", pid)
+            if m is None:
+                raise ValueError(f"Cannot parse Patient_ID in prompt table: {pid}")
+            video_id = int(m.group(1))
+
+        if video_id in prompt_map and prompt_map[video_id] != mid:
+            raise ValueError(
+                f"Duplicate Patient_ID with different middle slice: {pid} -> {prompt_map[video_id]} vs {mid}"
+            )
+        prompt_map[video_id] = mid
+
+    if len(prompt_map) == 0:
+        raise ValueError(f"No valid middle prompt records loaded from: {prompt3_xlsx}")
+
+    print(f"[INFO] Loaded middle prompt IDs for {len(prompt_map)} patients")
+    return prompt_map
+
+
+def _fallback_middle_from_gt(gt_o: np.ndarray, lower: int, upper: int) -> int:
+    pos = np.where(gt_o.reshape(gt_o.shape[0], -1).any(axis=1))[0]
+    middle_candidates = [int(z) for z in pos.tolist() if lower < int(z) < upper]
+    if len(middle_candidates) == 0:
+        return int(lower)
+    middle_candidates = sorted(middle_candidates)
+    return int(middle_candidates[len(middle_candidates) // 2])
+
+
+def _valid_mid_for_object(gt_o: np.ndarray, mid: int, lower: int, upper: int) -> int:
+    t_dim = gt_o.shape[0]
+    mid = max(0, min(int(mid), t_dim - 1))
+    if bool(gt_o[mid].any()):
+        return mid
+    if bool(gt_o[lower].any()):
+        return int(lower)
+    if bool(gt_o[upper].any()):
+        return int(upper)
+    return int(mid)
+
+
+def select_oracle_middle_from_table(
+    batch_masks: torch.Tensor,
+    unique_objects_identifier: torch.Tensor,
+    middle_prompt_by_video_id: dict,
+    allow_missing_middle: bool,
+):
     t_dim, o_dim = batch_masks.shape[:2]
     runtime_map = {}
-
-    pred_vols = []
-    for t in range(t_dim):
-        pred_t = (outputs[t]["pred_masks_high_res"][:, 0] > 0).detach().cpu().numpy().astype(np.uint8)
-        pred_vols.append(pred_t)
-    pred_vols = np.stack(pred_vols, axis=0)
-
     gt_vols = batch_masks.detach().cpu().numpy().astype(np.uint8)
 
     for o in range(o_dim):
         video_id = int(unique_objects_identifier[0, o, 0].item())
-
         gt_o = gt_vols[:, o]
-        pred_o = pred_vols[:, o]
-
         pos = np.where(gt_o.reshape(t_dim, -1).any(axis=1))[0]
         if len(pos) == 0:
             runtime_map[video_id] = 0
@@ -493,28 +552,15 @@ def select_worst_hd95_middle_from_outputs(outputs, batch_masks: torch.Tensor, un
 
         lower = int(pos.min())
         upper = int(pos.max())
-
-        candidate_slices = list(range(lower + 1, upper))
-        if len(candidate_slices) == 0:
-            runtime_map[video_id] = lower
-            continue
-
-        valid_scores = []
-
-        for z in candidate_slices:
-            score = _safe_hd95_2d(pred_o[z], gt_o[z])
-
-            # 只保留有效slice
-            if score >= 0:
-                valid_scores.append((z, score))
-
-        # 如果全是无效slice → fallback
-        if len(valid_scores) == 0:
-            runtime_map[video_id] = lower
-        else:
-            best_slice = max(valid_scores, key=lambda x: x[1])[0]
-            runtime_map[video_id] = int(best_slice)
-
+        external_mid = middle_prompt_by_video_id.get(video_id)
+        if external_mid is None:
+            if not allow_missing_middle:
+                raise KeyError(
+                    f"Missing Best_Prompt_Slice_ID for video_id={video_id}. "
+                    "Please complete prompt table or use --allow-missing-middle."
+                )
+            external_mid = _fallback_middle_from_gt(gt_o, lower, upper)
+        runtime_map[video_id] = _valid_mid_for_object(gt_o, int(external_mid), lower, upper)
     return runtime_map
 
 def ddp_enabled() -> bool:
@@ -689,9 +735,47 @@ def load_ckpt(path: Path, model, optimizer=None, scheduler=None, scaler=None, ma
     return last_epoch, best_val_dice
 
 
+def resolve_best_ckpt_from_train_output(train_output_root: Path) -> Path:
+    best_fold_txt = train_output_root / "best_fold.txt"
+    if best_fold_txt.exists():
+        content = best_fold_txt.read_text(encoding="utf-8", errors="ignore")
+        m = re.search(r"best_ckpt:\s*(.+)", content)
+        if m:
+            p = Path(m.group(1).strip())
+            if p.exists():
+                return p
+
+    summary_csv = train_output_root / "cv_summary.csv"
+    if summary_csv.exists():
+        best_row = None
+        try:
+            with open(summary_csv, "r", encoding="utf-8", newline="") as f:
+                reader = csv.DictReader(f)
+                for row in reader:
+                    if "best_val_dice" not in row or "best_ckpt" not in row:
+                        continue
+                    try:
+                        score = float(row["best_val_dice"])
+                    except Exception:
+                        continue
+                    if best_row is None or score > best_row[0]:
+                        best_row = (score, row["best_ckpt"])
+            if best_row is not None:
+                p = Path(best_row[1].strip())
+                if p.exists():
+                    return p
+        except Exception:
+            pass
+
+    candidates = sorted(train_output_root.glob("fold_*/checkpoints/best.pth"))
+    if len(candidates) > 0:
+        return candidates[0]
+
+    raise FileNotFoundError(f"Cannot resolve best checkpoint from TrainResults: {train_output_root}")
+
+
 def run_epoch_two_pass(
     model,
-    selector_model,
     loader,
     loss_fn,
     optimizer,
@@ -701,7 +785,8 @@ def run_epoch_two_pass(
     train_mode: bool,
     stage1_loss_weight: float,
     stage2_loss_weight: float,
-    two_pass_mode: str,
+    middle_prompt_by_video_id: dict,
+    allow_missing_middle: bool,
     forward_backbone_per_frame: bool = False,
     empty_cache_every: int = 0,
 ):
@@ -711,7 +796,6 @@ def run_epoch_two_pass(
     n_batch = 0
 
     core_model = unwrap_model(model)
-    selector_core_model = unwrap_model(selector_model)
 
     for batch_idx, batch in enumerate(loader, start=1):
         if train_mode:
@@ -733,11 +817,8 @@ def run_epoch_two_pass(
         )
 
         stage1_needs_grad = stage1_loss_weight > 0.0
-        output_dict_stage1 = None
-        outputs_stage1 = None
-
-        # Optional stage-1 auxiliary loss on trainable model.
-        if stage1_needs_grad:
+        grad_ctx = nullcontext() if stage1_needs_grad else torch.no_grad()
+        with grad_ctx:
             with torch.cuda.amp.autocast(
                 enabled=(device.type == "cuda"),
                 dtype=amp_dtype,
@@ -748,52 +829,25 @@ def run_epoch_two_pass(
                 outputs_stage1 = _outputs_from_tracking_dict(
                     output_dict_stage1, backbone_stage1["num_frames"]
                 )
-                loss_dict_stage1 = loss_fn(outputs_stage1, batch.masks)
-                loss_stage1 = (
-                    loss_dict_stage1["core_loss"]
-                    if isinstance(loss_dict_stage1, dict)
-                    else loss_dict_stage1
-                )
-        else:
-            loss_stage1 = torch.zeros((), device=device, dtype=torch.float32)
+                if stage1_needs_grad:
+                    loss_dict_stage1 = loss_fn(outputs_stage1, batch.masks)
+                    loss_stage1 = (
+                        loss_dict_stage1["core_loss"]
+                        if isinstance(loss_dict_stage1, dict)
+                        else loss_dict_stage1
+                    )
+                else:
+                    loss_stage1 = torch.zeros((), device=device, dtype=torch.float32)
 
-        # Fixed selector pass-1: used for middle selection + iterative memory seed.
-        if selector_core_model is None:
-            raise RuntimeError("A valid selector model is required for this training logic.")
-
-        selector_core_model.clear_runtime_middle_prompt_map()
-        with torch.no_grad():
-            selector_base_backbone_out = _precompute_backbone_out(
-                selector_core_model,
-                batch,
-                forward_backbone_per_frame=forward_backbone_per_frame,
-            )
-            selector_backbone_stage1 = selector_core_model.prepare_prompt_inputs(
-                _clone_backbone_out(selector_base_backbone_out), batch
-            )
-            with torch.cuda.amp.autocast(
-                enabled=(device.type == "cuda"),
-                dtype=amp_dtype,
-            ):
-                selector_output_dict_stage1 = _forward_tracking_iterative(
-                    selector_core_model, selector_backbone_stage1, batch
-                )
-                selector_outputs_stage1 = _outputs_from_tracking_dict(
-                    selector_output_dict_stage1, selector_backbone_stage1["num_frames"]
-                )
-
-        runtime_middle_map = select_worst_hd95_middle_from_outputs(
-            outputs=selector_outputs_stage1,
+        runtime_middle_map = select_oracle_middle_from_table(
             batch_masks=batch.masks,
             unique_objects_identifier=batch.metadata.unique_objects_identifier,
+            middle_prompt_by_video_id=middle_prompt_by_video_id,
+            allow_missing_middle=allow_missing_middle,
         )
-        selector_core_model.clear_runtime_middle_prompt_map()
-        del selector_outputs_stage1, selector_backbone_stage1, selector_base_backbone_out
 
         # -------------------------
-        # Pass-2:
-        # - iterative: continue on stage-1 memory and inject middle prompt
-        # - independent: fresh second forward with upper/lower/middle
+        # Pass-2 (iterative only): continue on stage-1 memory and inject middle prompt
         # -------------------------
         core_model.set_runtime_middle_prompt_map(runtime_middle_map)
 
@@ -801,32 +855,20 @@ def run_epoch_two_pass(
             enabled=(device.type == "cuda"),
             dtype=amp_dtype,
         ):
-            if two_pass_mode == "iterative":
-                backbone_stage2, middle_frames = _append_middle_prompts_inplace(
-                    core_model, base_backbone_out, backbone_stage1, batch
-                )
-
-                processing_order = middle_frames + [
-                    t for t in backbone_stage2["frames_not_in_init_cond"]
-                    if t not in set(middle_frames)
-                ]
-
-                output_dict_stage2 = _forward_tracking_iterative(
-                    core_model,
-                    backbone_stage2,
-                    batch,
-                    output_dict=selector_output_dict_stage1,
-                    processing_order=processing_order
-                )
-            else:
-                backbone_stage2 = core_model.prepare_prompt_inputs(
-                    _clone_backbone_out(base_backbone_out), batch
-                )
-                output_dict_stage2 = _forward_tracking_iterative(
-                    core_model,
-                    backbone_stage2,
-                    batch,
-                )
+            backbone_stage2, middle_frames = _append_middle_prompts_inplace(
+                core_model, base_backbone_out, backbone_stage1, batch
+            )
+            processing_order = middle_frames + [
+                t for t in backbone_stage2["frames_not_in_init_cond"]
+                if t not in set(middle_frames)
+            ]
+            output_dict_stage2 = _forward_tracking_iterative(
+                core_model,
+                backbone_stage2,
+                batch,
+                output_dict=output_dict_stage1,
+                processing_order=processing_order
+            )
             outputs_stage2 = _outputs_from_tracking_dict(
                 output_dict_stage2, backbone_stage2["num_frames"]
             )
@@ -848,17 +890,9 @@ def run_epoch_two_pass(
         n_batch += 1
 
         core_model.clear_runtime_middle_prompt_map()
-        if selector_core_model is not None:
-            selector_core_model.clear_runtime_middle_prompt_map()
         # Release large per-batch references as early as possible.
         del outputs_stage2, output_dict_stage2, backbone_stage2
-        del backbone_stage1, base_backbone_out
-        if output_dict_stage1 is not None:
-            del output_dict_stage1
-        if outputs_stage1 is not None:
-            del outputs_stage1
-        if selector_output_dict_stage1 is not None:
-            del selector_output_dict_stage1
+        del backbone_stage1, output_dict_stage1, base_backbone_out
         del runtime_middle_map, loss_stage2, loss_stage1, loss
         if (
             empty_cache_every > 0
@@ -893,9 +927,9 @@ def make_folds(patient_dirs, num_folds: int, seed: int):
 
 
 def main():
-    parser = argparse.ArgumentParser("SAM2 upper/lower -> online worst-HD95 middle iterative mask finetuning")
-    parser.add_argument("--train-root", type=Path, default=DEFAULT_TRAIN_ROOT, help="Directory containing train patient folders")
-    parser.add_argument("--output-root", type=Path, default=DEFAULT_OUTPUT_ROOT, help="Output root for folds/checkpoints/logs")
+    parser = argparse.ArgumentParser("SAM2 upper/lower -> oracle middle iterative mask finetuning")
+    parser.add_argument("--train-root", type=Path, required=True, help="Directory containing train patient folders")
+    parser.add_argument("--output-root", type=Path, required=True, help="Output root for folds/checkpoints/logs")
     parser.add_argument(
         "--model-cfg",
         type=str,
@@ -903,40 +937,13 @@ def main():
         help="SAM2 model config in Hydra (e.g. configs/sam2.1/sam2.1_hiera_l.yaml)",
     )
     parser.add_argument(
-        "--pretrained-ckpt",
+        "--init-train-output-root",
         type=Path,
-        default=DEFAULT_PRETRAINED_CKPT,
-        help="Pretrained checkpoint for finetuning",
+        required=True,
+        help="External TrainResults root; script auto-resolves best fold checkpoint for shared stage-1/stage-2 initialization.",
     )
-    parser.add_argument(
-        "--selector-ckpt",
-        type=Path,
-        default=DEFAULT_SELECTOR_CKPT,
-        help="Selector checkpoint for pass-1 middle-slice selection/memory seed.",
-    )
-    parser.add_argument(
-        "--selector-train-output-root",
-        type=Path,
-        default=DEFAULT_SELECTOR_TRAIN_OUTPUT_ROOT,
-        help="Training output root for auto resolving selector best fold checkpoint.",
-    )
-    parser.add_argument(
-        "--selector-no-auto-best-fold",
-        action="store_true",
-        help="Disable auto loading selector best_ckpt from selector_train_output_root/best_fold.txt.",
-    )
-    parser.add_argument(
-        "--train-init-from-selector",
-        action="store_true",
-        help="Initialize the trainable model from selector checkpoint instead of --pretrained-ckpt.",
-    )
-    parser.add_argument(
-        "--stage2-train-target",
-        type=str,
-        default="selector",
-        choices=["selector", "main"],
-        help="Which model is optimized in pass-2: selector or main.",
-    )
+    parser.add_argument("--prompt3-xlsx", type=Path, required=True, help="Oracle prompt table with Patient_ID and Best_Prompt_Slice_ID")
+    parser.add_argument("--allow-missing-middle", action="store_true", help="Allow cases missing Best_Prompt_Slice_ID and fallback to GT-middle rule")
     parser.add_argument("--image-name", type=str, default="image.nii.gz")
     parser.add_argument("--mask-name", type=str, default="CTV.nii.gz")
     parser.add_argument("--num-folds", type=int, default=5)
@@ -968,13 +975,6 @@ def main():
     )
     parser.add_argument("--stage1-loss-weight", type=float, default=0.0)
     parser.add_argument("--stage2-loss-weight", type=float, default=1.0)
-    parser.add_argument(
-        "--two-pass-mode",
-        type=str,
-        default="iterative",
-        choices=["iterative", "independent"],
-        help="iterative: stage2 continues on stage1 memory; independent: two standalone forwards",
-    )
     parser.add_argument(
         "--resume",
         action="store_true",
@@ -1008,20 +1008,14 @@ def main():
 
     if not args.train_root.exists():
         raise FileNotFoundError(f"train root not found: {args.train_root}")
-    if (not args.train_init_from_selector) and (not args.pretrained_ckpt.exists()):
-        raise FileNotFoundError(f"pretrained checkpoint not found: {args.pretrained_ckpt}")
+    if not args.init_train_output_root.exists():
+        raise FileNotFoundError(f"init TrainResults root not found: {args.init_train_output_root}")
+    if not args.prompt3_xlsx.exists():
+        raise FileNotFoundError(f"prompt3 xlsx not found: {args.prompt3_xlsx}")
 
-    selector_ckpt_path = resolve_ckpt(
-        pretrained_ckpt=args.selector_ckpt,
-        train_output_root=args.selector_train_output_root,
-        default_ckpt=DEFAULT_SELECTOR_CKPT,
-        auto_best_fold=(not args.selector_no_auto_best_fold),
-    )
-    train_init_ckpt_path = selector_ckpt_path if args.train_init_from_selector else args.pretrained_ckpt
+    init_ckpt = resolve_best_ckpt_from_train_output(args.init_train_output_root)
     if is_main_process():
-        print(f"[INFO] Selector checkpoint: {selector_ckpt_path}")
-        print(f"[INFO] Trainable model init checkpoint: {train_init_ckpt_path}")
-        print(f"[INFO] Stage-2 train target: {args.stage2_train_target}")
+        print(f"[INFO] init checkpoint resolved from {args.init_train_output_root}: {init_ckpt}")
 
     set_seed(args.seed)
     if use_ddp:
@@ -1029,10 +1023,24 @@ def main():
     else:
         device = torch.device(args.device if (args.device == "cpu" or torch.cuda.is_available()) else "cpu")
     amp_dtype = torch.bfloat16 if args.amp_dtype == "bfloat16" else torch.float16
+    middle_prompt_by_video_id = load_middle_prompt_map(args.prompt3_xlsx)
 
     patient_dirs = sorted([p for p in args.train_root.iterdir() if p.is_dir()], key=patient_sort_key)
     if len(patient_dirs) < args.num_folds:
         raise ValueError(f"patients ({len(patient_dirs)}) < num_folds ({args.num_folds})")
+    if not args.allow_missing_middle:
+        missing = []
+        for p in patient_dirs:
+            pid = patient_id_from_folder(p)
+            vid = patient_video_num_from_id(pid)
+            if vid not in middle_prompt_by_video_id:
+                missing.append(pid)
+        if len(missing) > 0:
+            preview = ", ".join(missing[:10])
+            raise ValueError(
+                f"Missing Best_Prompt_Slice_ID for {len(missing)} train cases. "
+                f"Examples: {preview}. Please complete prompt table or use --allow-missing-middle"
+            )
 
     if is_main_process():
         args.output_root.mkdir(parents=True, exist_ok=True)
@@ -1108,39 +1116,14 @@ def main():
 
         model = build_model(
             model_cfg_dict_template=model_cfg_dict_template,
-            pretrained_ckpt=train_init_ckpt_path,
+            pretrained_ckpt=init_ckpt,
             freeze_image_encoder=args.freeze_image_encoder,
             device=device,
         )
-        selector_model = build_model(
-            model_cfg_dict_template=model_cfg_dict_template,
-            pretrained_ckpt=selector_ckpt_path,
-            freeze_image_encoder=(args.freeze_image_encoder if args.stage2_train_target == "selector" else True),
-            device=device,
-        )
-
-        # Configure which model is trainable in pass-2.
-        if args.stage2_train_target == "selector":
-            for p in model.parameters():
-                p.requires_grad = False
-            model.eval()
-            for p in selector_model.parameters():
-                p.requires_grad = True
-            train_model = selector_model
-            selector_for_pass1 = selector_model
-        else:
-            for p in selector_model.parameters():
-                p.requires_grad = False
-            selector_model.eval()
-            train_model = model
-            selector_for_pass1 = selector_model
-
         if use_ddp:
-            train_model = DDP(train_model, device_ids=[local_rank], output_device=local_rank, find_unused_parameters=True)
-            if args.stage2_train_target == "selector":
-                selector_for_pass1 = train_model
+            model = DDP(model, device_ids=[local_rank], output_device=local_rank, find_unused_parameters=True)
 
-        optimizer = build_optimizer(train_model, args.base_lr, args.vision_lr, args.weight_decay)
+        optimizer = build_optimizer(model, args.base_lr, args.vision_lr, args.weight_decay)
         scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
             optimizer,
             mode="max",
@@ -1168,7 +1151,7 @@ def main():
             if resume_ckpt.exists():
                 start_epoch, best_val_dice = load_ckpt(
                     path=resume_ckpt,
-                    model=train_model,
+                    model=model,
                     optimizer=optimizer,
                     scheduler=scheduler,
                     scaler=scaler,
@@ -1204,8 +1187,7 @@ def main():
                 train_sampler.set_epoch(epoch)
 
             tr_loss, tr_dice = run_epoch_two_pass(
-                model=train_model,
-                selector_model=selector_for_pass1,
+                model=model,
                 loader=train_loader,
                 loss_fn=loss_fn,
                 optimizer=optimizer,
@@ -1215,15 +1197,15 @@ def main():
                 train_mode=True,
                 stage1_loss_weight=args.stage1_loss_weight,
                 stage2_loss_weight=args.stage2_loss_weight,
-                two_pass_mode=args.two_pass_mode,
+                middle_prompt_by_video_id=middle_prompt_by_video_id,
+                allow_missing_middle=args.allow_missing_middle,
                 forward_backbone_per_frame=args.forward_backbone_per_frame,
                 empty_cache_every=args.empty_cache_every,
             )
 
             with torch.no_grad():
                 va_loss, va_dice = run_epoch_two_pass(
-                    model=train_model,
-                    selector_model=selector_for_pass1,
+                    model=model,
                     loader=val_loader,
                     loss_fn=loss_fn,
                     optimizer=optimizer,
@@ -1233,7 +1215,8 @@ def main():
                     train_mode=False,
                     stage1_loss_weight=args.stage1_loss_weight,
                     stage2_loss_weight=args.stage2_loss_weight,
-                    two_pass_mode=args.two_pass_mode,
+                    middle_prompt_by_video_id=middle_prompt_by_video_id,
+                    allow_missing_middle=args.allow_missing_middle,
                     forward_backbone_per_frame=args.forward_backbone_per_frame,
                     empty_cache_every=args.empty_cache_every,
                 )
@@ -1260,7 +1243,7 @@ def main():
             save_ckpt(
                 ckpt_dir / "last.pth",
                 epoch + 1,
-                train_model,
+                model,
                 optimizer,
                 scheduler,
                 scaler,
@@ -1272,7 +1255,7 @@ def main():
                 save_ckpt(
                     ckpt_dir / "best.pth",
                     epoch + 1,
-                    train_model,
+                    model,
                     optimizer,
                     scheduler,
                     scaler,

@@ -1,10 +1,10 @@
 ﻿#!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
-SAM2 finetuning with true two-pass prompting:
-  pass-1: upper + lower mask prompts only
-  select middle slice online from pass-1 prediction using worst 2D HD95
-  pass-2: upper + lower + selected middle mask prompt
+SAM2 finetuning with iterative two-stage prompting (rule middle):
+  pass-1: upper + lower prompts
+  middle slice: rule-based (same source as rule_mask/mask_prompt_3/one_epoch)
+  pass-2: continue from pass-1 memory and inject middle prompt
 
 Example:
 CUDA_VISIBLE_DEVICES=0,1 torchrun --nproc_per_node=2 train_upper_lower_online_hd95_middle_cv.py
@@ -68,11 +68,8 @@ from training.loss_fns import MultiStepMultiMasksAndIous
 from training.utils.data_utils import Frame, Object, VideoDatapoint, collate_fn
 
 
-# ================= Default Paths (edit here) =================
-DEFAULT_TRAIN_ROOT = Path("/home/wusi/SAM2/SAM2data/Eso/20260326/datanii/train_nii")
-DEFAULT_OUTPUT_ROOT = Path("/home/wusi/SAM2/SAM2data/Eso/20260326/Train/BadHD95_slice/mask_prompt_3/one_epoch/TrainResult")
+# ================= Defaults =================
 DEFAULT_MODEL_CFG = "configs/sam2.1/sam2.1_hiera_l.yaml"
-DEFAULT_PRETRAINED_CKPT = Path("/home/wusi/SAM2/checkpoints/sam2.1_hiera_large.pt")
 
 
 def set_seed(seed: int):
@@ -447,24 +444,14 @@ def _safe_hd95_2d(pred2d: np.ndarray, gt2d: np.ndarray) -> float:
         return -1.0
 
 
-def select_worst_hd95_middle_from_outputs(outputs, batch_masks: torch.Tensor, unique_objects_identifier):
+def select_rule_middle_from_gt(batch_masks: torch.Tensor, unique_objects_identifier):
     t_dim, o_dim = batch_masks.shape[:2]
     runtime_map = {}
-
-    pred_vols = []
-    for t in range(t_dim):
-        pred_t = (outputs[t]["pred_masks_high_res"][:, 0] > 0).detach().cpu().numpy().astype(np.uint8)
-        pred_vols.append(pred_t)
-    pred_vols = np.stack(pred_vols, axis=0)
-
     gt_vols = batch_masks.detach().cpu().numpy().astype(np.uint8)
 
     for o in range(o_dim):
         video_id = int(unique_objects_identifier[0, o, 0].item())
-
         gt_o = gt_vols[:, o]
-        pred_o = pred_vols[:, o]
-
         pos = np.where(gt_o.reshape(t_dim, -1).any(axis=1))[0]
         if len(pos) == 0:
             runtime_map[video_id] = 0
@@ -472,28 +459,12 @@ def select_worst_hd95_middle_from_outputs(outputs, batch_masks: torch.Tensor, un
 
         lower = int(pos.min())
         upper = int(pos.max())
-
-        candidate_slices = list(range(lower + 1, upper))
-        if len(candidate_slices) == 0:
+        middle_candidates = [int(z) for z in pos.tolist() if lower < int(z) < upper]
+        if len(middle_candidates) == 0:
             runtime_map[video_id] = lower
             continue
-
-        valid_scores = []
-
-        for z in candidate_slices:
-            score = _safe_hd95_2d(pred_o[z], gt_o[z])
-
-            # 只保留有效slice
-            if score >= 0:
-                valid_scores.append((z, score))
-
-        # 如果全是无效slice → fallback
-        if len(valid_scores) == 0:
-            runtime_map[video_id] = lower
-        else:
-            best_slice = max(valid_scores, key=lambda x: x[1])[0]
-            runtime_map[video_id] = int(best_slice)
-
+        middle_candidates = sorted(middle_candidates)
+        runtime_map[video_id] = int(middle_candidates[len(middle_candidates) // 2])
     return runtime_map
 
 def ddp_enabled() -> bool:
@@ -668,6 +639,45 @@ def load_ckpt(path: Path, model, optimizer=None, scheduler=None, scaler=None, ma
     return last_epoch, best_val_dice
 
 
+def resolve_best_ckpt_from_train_output(train_output_root: Path) -> Path:
+    best_fold_txt = train_output_root / "best_fold.txt"
+    if best_fold_txt.exists():
+        content = best_fold_txt.read_text(encoding="utf-8", errors="ignore")
+        m = re.search(r"best_ckpt:\s*(.+)", content)
+        if m:
+            p = Path(m.group(1).strip())
+            if p.exists():
+                return p
+
+    summary_csv = train_output_root / "cv_summary.csv"
+    if summary_csv.exists():
+        best_row = None
+        try:
+            with open(summary_csv, "r", encoding="utf-8", newline="") as f:
+                reader = csv.DictReader(f)
+                for row in reader:
+                    if "best_val_dice" not in row or "best_ckpt" not in row:
+                        continue
+                    try:
+                        score = float(row["best_val_dice"])
+                    except Exception:
+                        continue
+                    if best_row is None or score > best_row[0]:
+                        best_row = (score, row["best_ckpt"])
+            if best_row is not None:
+                p = Path(best_row[1].strip())
+                if p.exists():
+                    return p
+        except Exception:
+            pass
+
+    candidates = sorted(train_output_root.glob("fold_*/checkpoints/best.pth"))
+    if len(candidates) > 0:
+        return candidates[0]
+
+    raise FileNotFoundError(f"Cannot resolve best checkpoint from TrainResults: {train_output_root}")
+
+
 def run_epoch_two_pass(
     model,
     loader,
@@ -679,7 +689,6 @@ def run_epoch_two_pass(
     train_mode: bool,
     stage1_loss_weight: float,
     stage2_loss_weight: float,
-    two_pass_mode: str,
     forward_backbone_per_frame: bool = False,
     empty_cache_every: int = 0,
 ):
@@ -732,16 +741,13 @@ def run_epoch_two_pass(
                 else:
                     loss_stage1 = torch.zeros((), device=device, dtype=torch.float32)
 
-        runtime_middle_map = select_worst_hd95_middle_from_outputs(
-            outputs=outputs_stage1,
+        runtime_middle_map = select_rule_middle_from_gt(
             batch_masks=batch.masks,
             unique_objects_identifier=batch.metadata.unique_objects_identifier,
         )
 
         # -------------------------
-        # Pass-2:
-        # - iterative: continue on stage-1 memory and inject middle prompt
-        # - independent: fresh second forward with upper/lower/middle
+        # Pass-2 (iterative only): continue on stage-1 memory and inject middle prompt
         # -------------------------
         core_model.set_runtime_middle_prompt_map(runtime_middle_map)
 
@@ -749,32 +755,20 @@ def run_epoch_two_pass(
             enabled=(device.type == "cuda"),
             dtype=amp_dtype,
         ):
-            if two_pass_mode == "iterative":
-                backbone_stage2, middle_frames = _append_middle_prompts_inplace(
-                    core_model, base_backbone_out, backbone_stage1, batch
-                )
-
-                processing_order = middle_frames + [
-                    t for t in backbone_stage2["frames_not_in_init_cond"]
-                    if t not in set(middle_frames)
-                ]
-
-                output_dict_stage2 = _forward_tracking_iterative(
-                    core_model,
-                    backbone_stage2,
-                    batch,
-                    output_dict=output_dict_stage1,
-                    processing_order=processing_order
-                )
-            else:
-                backbone_stage2 = core_model.prepare_prompt_inputs(
-                    _clone_backbone_out(base_backbone_out), batch
-                )
-                output_dict_stage2 = _forward_tracking_iterative(
-                    core_model,
-                    backbone_stage2,
-                    batch,
-                )
+            backbone_stage2, middle_frames = _append_middle_prompts_inplace(
+                core_model, base_backbone_out, backbone_stage1, batch
+            )
+            processing_order = middle_frames + [
+                t for t in backbone_stage2["frames_not_in_init_cond"]
+                if t not in set(middle_frames)
+            ]
+            output_dict_stage2 = _forward_tracking_iterative(
+                core_model,
+                backbone_stage2,
+                batch,
+                output_dict=output_dict_stage1,
+                processing_order=processing_order
+            )
             outputs_stage2 = _outputs_from_tracking_dict(
                 output_dict_stage2, backbone_stage2["num_frames"]
             )
@@ -833,9 +827,9 @@ def make_folds(patient_dirs, num_folds: int, seed: int):
 
 
 def main():
-    parser = argparse.ArgumentParser("SAM2 upper/lower -> online worst-HD95 middle iterative mask finetuning")
-    parser.add_argument("--train-root", type=Path, default=DEFAULT_TRAIN_ROOT, help="Directory containing train patient folders")
-    parser.add_argument("--output-root", type=Path, default=DEFAULT_OUTPUT_ROOT, help="Output root for folds/checkpoints/logs")
+    parser = argparse.ArgumentParser("SAM2 upper/lower -> rule middle iterative mask finetuning")
+    parser.add_argument("--train-root", type=Path, required=True, help="Directory containing train patient folders")
+    parser.add_argument("--output-root", type=Path, required=True, help="Output root for folds/checkpoints/logs")
     parser.add_argument(
         "--model-cfg",
         type=str,
@@ -843,10 +837,10 @@ def main():
         help="SAM2 model config in Hydra (e.g. configs/sam2.1/sam2.1_hiera_l.yaml)",
     )
     parser.add_argument(
-        "--pretrained-ckpt",
+        "--init-train-output-root",
         type=Path,
-        default=DEFAULT_PRETRAINED_CKPT,
-        help="Pretrained checkpoint for finetuning",
+        required=True,
+        help="External TrainResults root; script auto-resolves best fold checkpoint for shared stage-1/stage-2 initialization.",
     )
     parser.add_argument("--image-name", type=str, default="image.nii.gz")
     parser.add_argument("--mask-name", type=str, default="CTV.nii.gz")
@@ -880,13 +874,6 @@ def main():
     parser.add_argument("--stage1-loss-weight", type=float, default=0.0)
     parser.add_argument("--stage2-loss-weight", type=float, default=1.0)
     parser.add_argument(
-        "--two-pass-mode",
-        type=str,
-        default="iterative",
-        choices=["iterative", "independent"],
-        help="iterative: stage2 continues on stage1 memory; independent: two standalone forwards",
-    )
-    parser.add_argument(
         "--resume",
         action="store_true",
         help="Resume each fold from fold_x/checkpoints/last.pth when available.",
@@ -919,8 +906,12 @@ def main():
 
     if not args.train_root.exists():
         raise FileNotFoundError(f"train root not found: {args.train_root}")
-    if not args.pretrained_ckpt.exists():
-        raise FileNotFoundError(f"pretrained checkpoint not found: {args.pretrained_ckpt}")
+    if not args.init_train_output_root.exists():
+        raise FileNotFoundError(f"init TrainResults root not found: {args.init_train_output_root}")
+
+    init_ckpt = resolve_best_ckpt_from_train_output(args.init_train_output_root)
+    if is_main_process():
+        print(f"[INFO] init checkpoint resolved from {args.init_train_output_root}: {init_ckpt}")
 
     set_seed(args.seed)
     if use_ddp:
@@ -1007,7 +998,7 @@ def main():
 
         model = build_model(
             model_cfg_dict_template=model_cfg_dict_template,
-            pretrained_ckpt=args.pretrained_ckpt,
+            pretrained_ckpt=init_ckpt,
             freeze_image_encoder=args.freeze_image_encoder,
             device=device,
         )
@@ -1088,7 +1079,6 @@ def main():
                 train_mode=True,
                 stage1_loss_weight=args.stage1_loss_weight,
                 stage2_loss_weight=args.stage2_loss_weight,
-                two_pass_mode=args.two_pass_mode,
                 forward_backbone_per_frame=args.forward_backbone_per_frame,
                 empty_cache_every=args.empty_cache_every,
             )
@@ -1105,7 +1095,6 @@ def main():
                     train_mode=False,
                     stage1_loss_weight=args.stage1_loss_weight,
                     stage2_loss_weight=args.stage2_loss_weight,
-                    two_pass_mode=args.two_pass_mode,
                     forward_backbone_per_frame=args.forward_backbone_per_frame,
                     empty_cache_every=args.empty_cache_every,
                 )

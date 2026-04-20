@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python
+#!/usr/bin/env python
 # -*- coding: utf-8 -*-
 
 import argparse
@@ -12,19 +12,15 @@ from pathlib import Path
 import numpy as np
 import SimpleITK as sitk
 import torch
+from medpy.metric.binary import hd95 as medpy_hd95
 from openpyxl import Workbook
 from PIL import Image
-from medpy.metric.binary import hd95 as medpy_hd95
 
 # keep local import robust
 CURRENT_DIR = Path(__file__).resolve().parent
 
 
 def _find_project_root(start: Path) -> Path:
-    """
-    Find SAM2 repo root dynamically to avoid hard-coded parent depth.
-    Root must contain both `training` and `sam2` directories.
-    """
     for p in [start] + list(start.parents):
         if (p / "training").is_dir() and (p / "sam2").is_dir():
             return p
@@ -48,7 +44,6 @@ if str(PROJECT_ROOT) not in sys.path:
 from sam2.build_sam import build_sam2_video_predictor
 
 
-# ================= Default Paths (edit here) =================
 DEFAULT_TEST_ROOT = Path("/home/wusi/SAM2/SAM2data/Eso/20260326/datanii/test_nii")
 DEFAULT_OUTPUT_ROOT = Path("/home/wusi/SAM2/SAM2data/Eso/20260326/Train/BadHD95_slice/mask_prompt_3/two_epoch/TestResult")
 DEFAULT_MODEL_CFG = "configs/sam2.1/sam2.1_hiera_l.yaml"
@@ -103,39 +98,26 @@ def gt_positive_slices(gt_zyx: np.ndarray):
     return [int(z) for z in non_empty.tolist()]
 
 
-def relative_pos_upper_to_lower(slice_id: int, lower_id: int, upper_id: int) -> float:
-    if upper_id == lower_id:
-        return 0.0
-    return float((upper_id - slice_id) / (upper_id - lower_id))
-
-
 def safe_hd95_2d(pred2d: np.ndarray, gt2d: np.ndarray) -> float:
     pred2d = pred2d.astype(bool)
     gt2d = gt2d.astype(bool)
-
-    # Keep selection behavior aligned with training:
-    # if either side is empty, treat slice as invalid for HD95 ranking.
     if pred2d.sum() == 0 or gt2d.sum() == 0:
         return -1.0
-
     try:
         return float(medpy_hd95(pred2d, gt2d, voxelspacing=(1.0, 1.0)))
     except Exception:
         return -1.0
 
 
-def select_middle_from_first_pass_hd95(pred_zyx: np.ndarray, gt_zyx: np.ndarray, lower_id: int, upper_id: int) -> int:
+def select_middle_from_pred_and_gt_hd95(pred_zyx: np.ndarray, gt_zyx: np.ndarray, lower_id: int, upper_id: int) -> int:
     candidate_slices = list(range(lower_id + 1, upper_id))
     if len(candidate_slices) == 0:
         return int(lower_id)
-
     valid_scores = []
-
     for z in candidate_slices:
         score = safe_hd95_2d(pred_zyx[z], gt_zyx[z])
         if score >= 0:
             valid_scores.append((z, score))
-
     if len(valid_scores) == 0:
         return int(lower_id)
     return int(max(valid_scores, key=lambda x: x[1])[0])
@@ -147,8 +129,6 @@ def _propagate_to_mask(state, predictor, gt_zyx: np.ndarray, obj_id: int) -> np.
     for fidx, obj_ids, logits in predictor.propagate_in_video(state):
         for i, oid in enumerate(obj_ids):
             if int(oid) == obj_id:
-                # Align with training thresholding style:
-                # pred = (pred_masks_high_res[:, 0] > 0)
                 pred_i = logits[i]
                 if pred_i.ndim == 3 and pred_i.shape[0] == 1:
                     pred_i = pred_i[0]
@@ -158,21 +138,19 @@ def _propagate_to_mask(state, predictor, gt_zyx: np.ndarray, obj_id: int) -> np.
 
 
 @torch.no_grad()
-def infer_with_boundary_then_online_hd95_middle(
+def infer_two_stage_iterative(
     predictor,
     frame_dir: Path,
     gt_zyx: np.ndarray,
     lower_id: int,
     upper_id: int,
     obj_id: int,
-    two_pass_mode: str = "iterative",
 ):
-    # Pass-1: boundary only
+    # Stage-1: boundary prompts
     state = predictor.init_state(video_path=str(frame_dir))
     predictor.reset_state(state)
-    boundary_ids = sorted(set([int(lower_id), int(upper_id)]))
-
-    for sid in boundary_ids:
+    stage1_prompt_ids = sorted(set([int(lower_id), int(upper_id)]))
+    for sid in stage1_prompt_ids:
         prompt_mask = (gt_zyx[sid] > 0).astype(np.uint8)
         if prompt_mask.sum() == 0:
             raise RuntimeError(f"Prompt slice {sid} is empty in GT.")
@@ -182,46 +160,27 @@ def infer_with_boundary_then_online_hd95_middle(
             obj_id=obj_id,
             mask=prompt_mask,
         )
-
     pred_stage1 = _propagate_to_mask(state, predictor, gt_zyx, obj_id)
 
-    # Select middle from pass-1 prediction.
-    middle_id = select_middle_from_first_pass_hd95(
+    # Online bad_95 middle selection from stage-1 output
+    middle_id = select_middle_from_pred_and_gt_hd95(
         pred_zyx=pred_stage1,
         gt_zyx=gt_zyx,
         lower_id=lower_id,
         upper_id=upper_id,
     )
 
-    # Pass-2:
-    # - iterative: continue from pass-1 state and add middle only
-    # - independent: re-init and feed upper/lower/middle together
-    if two_pass_mode == "iterative":
-        if middle_id not in boundary_ids:
-            mid_mask = (gt_zyx[middle_id] > 0).astype(np.uint8)
-            if mid_mask.sum() == 0:
-                raise RuntimeError(f"Prompt slice {middle_id} is empty in GT.")
-            predictor.add_new_mask(
-                inference_state=state,
-                frame_idx=middle_id,
-                obj_id=obj_id,
-                mask=mid_mask,
-            )
-    else:
-        state = predictor.init_state(video_path=str(frame_dir))
-        predictor.reset_state(state)
-        prompt_ids = sorted(set([int(lower_id), int(upper_id), int(middle_id)]))
-        for sid in prompt_ids:
-            prompt_mask = (gt_zyx[sid] > 0).astype(np.uint8)
-            if prompt_mask.sum() == 0:
-                raise RuntimeError(f"Prompt slice {sid} is empty in GT.")
-            predictor.add_new_mask(
-                inference_state=state,
-                frame_idx=sid,
-                obj_id=obj_id,
-                mask=prompt_mask,
-            )
-
+    # Stage-2: iterative memory inheritance + middle prompt injection
+    if int(middle_id) not in stage1_prompt_ids:
+        middle_mask = (gt_zyx[int(middle_id)] > 0).astype(np.uint8)
+        if middle_mask.sum() == 0:
+            raise RuntimeError(f"Prompt slice {middle_id} is empty in GT.")
+        predictor.add_new_mask(
+            inference_state=state,
+            frame_idx=int(middle_id),
+            obj_id=obj_id,
+            mask=middle_mask,
+        )
     pred_stage2 = _propagate_to_mask(state, predictor, gt_zyx, obj_id)
     return pred_stage1, pred_stage2, middle_id
 
@@ -233,22 +192,16 @@ def patient_id_from_folder(pdir: Path):
     return f"CTV_{int(m.group()):03d}"
 
 
-def resolve_ckpt(finetuned_ckpt: Path, train_output_root: Path, auto_best_fold: bool = True) -> Path:
-    """
-    Priority:
-    1) when auto_best_fold=True, best fold from best_fold.txt under train_output_root
-    2) explicit --finetuned-ckpt if exists
-    3) DEFAULT_FINETUNED_CKPT
-    """
-    if auto_best_fold:
-        best_fold_txt = train_output_root / "best_fold.txt"
-        if best_fold_txt.exists():
-            content = best_fold_txt.read_text(encoding="utf-8", errors="ignore")
-            m = re.search(r"best_ckpt:\s*(.+)", content)
-            if m:
-                best_ckpt = Path(m.group(1).strip())
-                if best_ckpt.exists():
-                    return best_ckpt
+def resolve_ckpt(finetuned_ckpt: Path, train_output_root: Path) -> Path:
+    # Use training best fold checkpoint first.
+    best_fold_txt = train_output_root / "best_fold.txt"
+    if best_fold_txt.exists():
+        content = best_fold_txt.read_text(encoding="utf-8", errors="ignore")
+        m = re.search(r"best_ckpt:\s*(.+)", content)
+        if m:
+            best_ckpt = Path(m.group(1).strip())
+            if best_ckpt.exists():
+                return best_ckpt
 
     if finetuned_ckpt.exists():
         return finetuned_ckpt
@@ -258,15 +211,15 @@ def resolve_ckpt(finetuned_ckpt: Path, train_output_root: Path, auto_best_fold: 
 
     raise FileNotFoundError(
         "No usable finetuned checkpoint found. "
-        f"Tried: {finetuned_ckpt}, best_fold.txt in {train_output_root}, {DEFAULT_FINETUNED_CKPT}"
+        f"Tried: best_fold.txt in {train_output_root}, {finetuned_ckpt}, {DEFAULT_FINETUNED_CKPT}"
     )
 
 
 def main():
-    parser = argparse.ArgumentParser("Test SAM2 with upper/lower -> online worst-HD95 middle prompts")
+    parser = argparse.ArgumentParser("Test SAM2 with online bad_95 iterative two-stage prompts")
     parser.add_argument("--test-root", type=Path, default=DEFAULT_TEST_ROOT, help="Separate test set root")
     parser.add_argument("--output-root", type=Path, default=DEFAULT_OUTPUT_ROOT, help="Save root for masks/excel")
-    parser.add_argument("--finetuned-ckpt", type=Path, default=DEFAULT_FINETUNED_CKPT, help="Checkpoint for inference")
+    parser.add_argument("--finetuned-ckpt", type=Path, default=DEFAULT_FINETUNED_CKPT, help="Fallback checkpoint for inference")
     parser.add_argument("--train-output-root", type=Path, default=DEFAULT_TRAIN_OUTPUT_ROOT, help="Training output root for auto resolving best fold ckpt")
     parser.add_argument("--model-cfg", type=str, default=DEFAULT_MODEL_CFG)
     parser.add_argument("--img-name", type=str, default="image.nii.gz")
@@ -275,28 +228,12 @@ def main():
     parser.add_argument("--window-center", type=float, default=40.0)
     parser.add_argument("--window-width", type=float, default=400.0)
     parser.add_argument("--device", type=str, default="cuda")
-    parser.add_argument("--excel-name", type=str, default="online_hd95_middle_results.xlsx")
-    parser.add_argument(
-        "--no-auto-best-fold",
-        action="store_true",
-        help="Disable auto loading best_ckpt from train_output_root/best_fold.txt.",
-    )
-    parser.add_argument(
-        "--two-pass-mode",
-        type=str,
-        default="iterative",
-        choices=["iterative", "independent"],
-        help="iterative: stage2 continues on stage1 state; independent: re-init and feed 3 prompts",
-    )
+    parser.add_argument("--excel-name", type=str, default="two_epoch_iterative_bad95_results.xlsx")
     args = parser.parse_args()
 
     if not args.test_root.exists():
         raise FileNotFoundError(f"test root not found: {args.test_root}")
-    ckpt_path = resolve_ckpt(
-        args.finetuned_ckpt,
-        args.train_output_root,
-        auto_best_fold=(not args.no_auto_best_fold),
-    )
+    ckpt_path = resolve_ckpt(args.finetuned_ckpt, args.train_output_root)
 
     args.output_root.mkdir(parents=True, exist_ok=True)
     best_mask_dir = args.output_root / "best_mask"
@@ -316,8 +253,7 @@ def main():
     patient_dirs = sorted([p for p in args.test_root.iterdir() if p.is_dir()])
     print(f"[INFO] Found {len(patient_dirs)} patients")
 
-    all_rows = []
-
+    rows = []
     for pdir in patient_dirs:
         patient_id = patient_id_from_folder(pdir)
         out_mask_path = best_mask_dir / f"{patient_id}.nii.gz"
@@ -340,83 +276,60 @@ def main():
         if len(pos) == 0:
             print(f"[WARN] Skip {pdir.name}: GT has no positive slices")
             continue
-
         lower_id = int(min(pos))
         upper_id = int(max(pos))
 
         tmp_dir = Path(tempfile.mkdtemp(prefix=f"sam2_test_{pdir.name}_"))
         try:
             save_frames_from_volume(img_zyx, tmp_dir, args.window_center, args.window_width)
-            pred_stage1, pred_stage2, middle_id = infer_with_boundary_then_online_hd95_middle(
+            pred_stage1, pred_stage2, middle_id = infer_two_stage_iterative(
                 predictor=predictor,
                 frame_dir=tmp_dir,
                 gt_zyx=gt_zyx,
                 lower_id=lower_id,
                 upper_id=upper_id,
                 obj_id=args.obj_id,
-                two_pass_mode=args.two_pass_mode,
             )
             dice_stage1 = dice_3d(pred_stage1, gt_zyx)
             dice_stage2 = dice_3d(pred_stage2, gt_zyx)
-
-            rel = relative_pos_upper_to_lower(middle_id, lower_id, upper_id)
             write_mask_like(pred_stage2, img_sitk, out_mask_path)
-
             print(
-                f"[OK] {patient_id}: stage1_dice={dice_stage1:.4f}, "
-                f"stage2_dice={dice_stage2:.4f}, middle={middle_id} -> {out_mask_path}"
+                f"[OK] {patient_id}: stage1_dice={dice_stage1:.4f}, stage2_dice={dice_stage2:.4f}, "
+                f"middle={middle_id} -> {out_mask_path}"
             )
 
-            all_rows.append(
+            rows.append(
                 {
                     "Patient_ID": patient_id,
                     "Prompt_Slice_ID": f"{upper_id},{lower_id},{middle_id}",
                     "Lower_Bound_ID": lower_id,
                     "Upper_Bound_ID": upper_id,
                     "Middle_ID": middle_id,
-                    "Prompt_Rel_Pos_UpperToLower": rel,
-                    "Dice3D_stage1": dice_stage1,
-                    "Dice3D_stage2": dice_stage2,
+                    "Dice3D_Stage1": dice_stage1,
+                    "Dice3D_Stage2": dice_stage2,
                 }
             )
         finally:
             shutil.rmtree(tmp_dir, ignore_errors=True)
 
-    def _pid_key(row):
-        mm = re.search(r"(\d+)$", str(row["Patient_ID"]))
-        return int(mm.group(1)) if mm else 10**9
-
-    all_rows.sort(key=_pid_key)
+    rows.sort(key=lambda r: int(re.search(r"(\d+)$", str(r["Patient_ID"])).group(1)) if re.search(r"(\d+)$", str(r["Patient_ID"])) else 10**9)
 
     wb = Workbook()
-    ws_all = wb.active
-    ws_all.title = "Results"
-    ws_all.append(
-        [
-            "Patient_ID",
-            "Prompt_Slice_ID",
-            "Lower_Bound_ID",
-            "Upper_Bound_ID",
-            "Middle_ID",
-            "Prompt_Rel_Pos_UpperToLower",
-            "Dice3D_stage1",
-            "Dice3D_stage2",
-        ]
-    )
-    for r in all_rows:
-        ws_all.append(
+    ws = wb.active
+    ws.title = "Results"
+    ws.append(["Patient_ID", "Prompt_Slice_ID", "Lower_Bound_ID", "Upper_Bound_ID", "Middle_ID", "Dice3D_Stage1", "Dice3D_Stage2"])
+    for r in rows:
+        ws.append(
             [
                 r["Patient_ID"],
                 r["Prompt_Slice_ID"],
                 int(r["Lower_Bound_ID"]),
                 int(r["Upper_Bound_ID"]),
                 int(r["Middle_ID"]),
-                round(float(r["Prompt_Rel_Pos_UpperToLower"]), 6),
-                round(float(r["Dice3D_stage1"]), 6),
-                round(float(r["Dice3D_stage2"]), 6),
+                round(float(r["Dice3D_Stage1"]), 6),
+                round(float(r["Dice3D_Stage2"]), 6),
             ]
         )
-
     wb.save(str(out_xlsx))
     print(f"[DONE] Excel saved: {out_xlsx}")
     print(f"[DONE] Masks saved in: {best_mask_dir}")
