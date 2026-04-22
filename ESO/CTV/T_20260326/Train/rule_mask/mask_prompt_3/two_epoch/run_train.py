@@ -25,7 +25,7 @@ def main():
     parser = argparse.ArgumentParser(
         description="Run rule-mask two-epoch iterative training then testing (auto-resume enabled)."
     )
-    parser.add_argument("--gpu", type=str, default="4", help="CUDA_VISIBLE_DEVICES value")
+    parser.add_argument("--gpu", type=str, default="5", help="CUDA_VISIBLE_DEVICES value")
     parser.add_argument("--nproc-per-node", type=int, default=1, help="torchrun nproc per node")
     parser.add_argument("--torchrun", type=str, default="torchrun", help="torchrun executable")
     parser.add_argument("--python", type=str, default=sys.executable, help="python executable for test")

@@ -9,10 +9,10 @@ from pathlib import Path
 
 # ================= Centralized Paths =================
 DEFAULT_DATA_ROOT = Path("/home/wusi/SAM2/SAM2data/Eso/20260326/datanii")
-DEFAULT_EXP_ROOT = Path("/home/wusi/SAM2/SAM2data/Eso/20260326/Train/oracle_mask/mask_prompt_3/two_epoch")
+DEFAULT_EXP_ROOT = Path("/home/wusi/SAM2/SAM2data/Eso/20260326/Train/BadHD95_slice/mask_prompt_3/two_epoch_fix")
 DEFAULT_MODEL_CFG = "configs/sam2.1/sam2.1_hiera_l.yaml"
 DEFAULT_INIT_TRAIN_OUTPUT_ROOT = Path("/home/wusi/SAM2/SAM2data/Eso/20260326/Train/oracle_mask/mask_prompt_2/TrainResult")
-DEFAULT_PROMPT3_XLSX = Path("/home/wusi/SAM2/SAM2data/Eso/20260326/zero-shot/oracle_mask/mask_prompt_3/prompt_layer_search3.xlsx")
+DEFAULT_SELECTOR_TRAIN_OUTPUT_ROOT = Path("/home/wusi/SAM2/SAM2data/Eso/20260326/Train/oracle_mask/mask_prompt_2/TrainResult")
 
 
 def run_cmd(cmd, env=None, cwd=None):
@@ -24,7 +24,7 @@ def run_cmd(cmd, env=None, cwd=None):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Run oracle-mask two-epoch iterative training then testing (auto-resume enabled)."
+        description="Run bad_hd95 two-epoch iterative training with fixed external-HD95 middle then testing (auto-resume enabled)."
     )
     parser.add_argument("--gpu", type=str, default="5", help="CUDA_VISIBLE_DEVICES value")
     parser.add_argument("--nproc-per-node", type=int, default=1, help="torchrun nproc per node")
@@ -45,8 +45,12 @@ def main():
         default=DEFAULT_INIT_TRAIN_OUTPUT_ROOT,
         help="External TrainResults root used to auto-resolve best fold checkpoint for initialization.",
     )
-    parser.add_argument("--prompt3-xlsx", type=Path, default=DEFAULT_PROMPT3_XLSX, help="Oracle prompt table with Best_Prompt_Slice_ID")
-    parser.add_argument("--allow-missing-middle", action="store_true", help="Allow missing middle prompt in oracle table and fallback")
+    parser.add_argument(
+        "--selector-train-output-root",
+        type=Path,
+        default=DEFAULT_SELECTOR_TRAIN_OUTPUT_ROOT,
+        help="External TrainResults root used by selector model to choose fixed worst-HD95 middle.",
+    )
     args = parser.parse_args()
 
     script_dir = Path(__file__).resolve().parent
@@ -59,8 +63,8 @@ def main():
         raise FileNotFoundError(f"Test script not found: {test_script}")
     if not args.init_train_output_root.exists():
         raise FileNotFoundError(f"init TrainResults root not found: {args.init_train_output_root}")
-    if not args.prompt3_xlsx.exists():
-        raise FileNotFoundError(f"prompt3 xlsx not found: {args.prompt3_xlsx}")
+    if not args.selector_train_output_root.exists():
+        raise FileNotFoundError(f"selector TrainResults root not found: {args.selector_train_output_root}")
 
     env = os.environ.copy()
     env["CUDA_VISIBLE_DEVICES"] = args.gpu
@@ -82,16 +86,14 @@ def main():
         str(args.model_cfg),
         "--init-train-output-root",
         str(args.init_train_output_root),
-        "--prompt3-xlsx",
-        str(args.prompt3_xlsx),
+        "--selector-train-output-root",
+        str(args.selector_train_output_root),
         "--stage1-loss-weight",
         str(args.stage1_loss_weight),
         "--stage2-loss-weight",
         str(args.stage2_loss_weight),
         "--resume",
     ]
-    if args.allow_missing_middle:
-        train_cmd.append("--allow-missing-middle")
 
     test_cmd = [
         args.python,
@@ -102,13 +104,11 @@ def main():
         str(test_output_root),
         "--train-output-root",
         str(train_output_root),
-        "--prompt3-xlsx",
-        str(args.prompt3_xlsx),
+        "--selector-train-output-root",
+        str(args.selector_train_output_root),
         "--model-cfg",
         str(args.model_cfg),
     ]
-    if args.allow_missing_middle:
-        test_cmd.append("--allow-missing-middle")
 
     print(f"[INFO] Working dir: {script_dir}", flush=True)
     print(f"[INFO] CUDA_VISIBLE_DEVICES={env['CUDA_VISIBLE_DEVICES']}", flush=True)
@@ -117,7 +117,7 @@ def main():
     print(f"[INFO] train_output_root={train_output_root}", flush=True)
     print(f"[INFO] test_output_root={test_output_root}", flush=True)
     print(f"[INFO] init_train_output_root={args.init_train_output_root}", flush=True)
-    print(f"[INFO] prompt3_xlsx={args.prompt3_xlsx}", flush=True)
+    print(f"[INFO] selector_train_output_root={args.selector_train_output_root}", flush=True)
     print(f"[INFO] stage1_loss_weight={args.stage1_loss_weight}", flush=True)
     print(f"[INFO] stage2_loss_weight={args.stage2_loss_weight}", flush=True)
     print("[INFO] Resume policy: ON (always pass --resume)", flush=True)
