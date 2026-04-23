@@ -45,10 +45,10 @@ from sam2.build_sam import build_sam2_video_predictor
 
 
 DEFAULT_TEST_ROOT = Path("/home/wusi/SAM2/SAM2data/Eso/20260326/datanii/test_nii")
-DEFAULT_OUTPUT_ROOT = Path("/home/wusi/SAM2/SAM2data/Eso/20260326/Train/BadHD95_slice/mask_prompt_3/two_epoch/TestResult")
+DEFAULT_OUTPUT_ROOT = Path("/home/wusi/SAM2/SAM2data/Eso/20260326/Train/BadHD95_slice/mask_prompt_3/two_epoch_dynamic/TestResult")
 DEFAULT_MODEL_CFG = "configs/sam2.1/sam2.1_hiera_l.yaml"
-DEFAULT_FINETUNED_CKPT = Path("/home/wusi/SAM2/SAM2data/Eso/20260326/Train/BadHD95_slice/mask_prompt_3/two_epoch/TrainResult/fold_0/checkpoints/best.pth")
-DEFAULT_TRAIN_OUTPUT_ROOT = Path("/home/wusi/SAM2/SAM2data/Eso/20260326/Train/BadHD95_slice/mask_prompt_3/two_epoch/TrainResult")
+DEFAULT_FINETUNED_CKPT = Path("/home/wusi/SAM2/SAM2data/Eso/20260326/Train/BadHD95_slice/mask_prompt_3/two_epoch_dynamic/TrainResult/fold_0/checkpoints/best.pth")
+DEFAULT_TRAIN_OUTPUT_ROOT = Path("/home/wusi/SAM2/SAM2data/Eso/20260326/Train/BadHD95_slice/mask_prompt_3/two_epoch_dynamic/TrainResult")
 
 
 def window_to_uint8(img2d: np.ndarray, wc: float, ww: float) -> np.ndarray:
@@ -138,6 +138,68 @@ def _propagate_to_mask(state, predictor, gt_zyx: np.ndarray, obj_id: int) -> np.
 
 
 @torch.no_grad()
+def _propagate_in_custom_order(
+    state,
+    predictor,
+    processing_order,
+    pred_init: np.ndarray,
+    obj_id: int,
+) -> np.ndarray:
+    # Mirror predictor.propagate_in_video internals, but use explicit processing_order.
+    predictor.propagate_in_video_preflight(state)
+    obj_ids = state["obj_ids"]
+    batch_size = predictor._get_obj_num(state)
+    pred = pred_init.copy()
+
+    for frame_idx in processing_order:
+        pred_masks_per_obj = [None] * batch_size
+        for obj_idx in range(batch_size):
+            obj_output_dict = state["output_dict_per_obj"][obj_idx]
+            if frame_idx in obj_output_dict["cond_frame_outputs"]:
+                storage_key = "cond_frame_outputs"
+                current_out = obj_output_dict[storage_key][frame_idx]
+                device = state["device"]
+                pred_masks = current_out["pred_masks"].to(device, non_blocking=True)
+                if predictor.clear_non_cond_mem_around_input:
+                    predictor._clear_obj_non_cond_mem_around_input(
+                        state, frame_idx, obj_idx
+                    )
+            else:
+                storage_key = "non_cond_frame_outputs"
+                current_out, pred_masks = predictor._run_single_frame_inference(
+                    inference_state=state,
+                    output_dict=obj_output_dict,
+                    frame_idx=frame_idx,
+                    batch_size=1,
+                    is_init_cond_frame=False,
+                    point_inputs=None,
+                    mask_inputs=None,
+                    reverse=False,
+                    run_mem_encoder=True,
+                )
+                obj_output_dict[storage_key][frame_idx] = current_out
+
+            state["frames_tracked_per_obj"][obj_idx][frame_idx] = {"reverse": False}
+            pred_masks_per_obj[obj_idx] = pred_masks
+
+        if len(pred_masks_per_obj) > 1:
+            all_pred_masks = torch.cat(pred_masks_per_obj, dim=0)
+        else:
+            all_pred_masks = pred_masks_per_obj[0]
+        _, video_res_masks = predictor._get_orig_video_res_output(state, all_pred_masks)
+
+        for i, oid in enumerate(obj_ids):
+            if int(oid) == obj_id:
+                pred_i = video_res_masks[i]
+                if pred_i.ndim == 3 and pred_i.shape[0] == 1:
+                    pred_i = pred_i[0]
+                pred[int(frame_idx)] = (pred_i > 0).detach().cpu().numpy().astype(np.uint8)
+                break
+
+    return pred
+
+
+@torch.no_grad()
 def infer_two_stage_iterative(
     predictor,
     frame_dir: Path,
@@ -171,6 +233,7 @@ def infer_two_stage_iterative(
     )
 
     # Stage-2: iterative memory inheritance + middle prompt injection
+    stage1_init_cond = set(stage1_prompt_ids)
     if int(middle_id) not in stage1_prompt_ids:
         middle_mask = (gt_zyx[int(middle_id)] > 0).astype(np.uint8)
         if middle_mask.sum() == 0:
@@ -181,7 +244,23 @@ def infer_two_stage_iterative(
             obj_id=obj_id,
             mask=middle_mask,
         )
-    pred_stage2 = _propagate_to_mask(state, predictor, gt_zyx, obj_id)
+
+    stage2_init_cond = set(stage1_prompt_ids)
+    if int(middle_id) not in stage1_init_cond:
+        stage2_init_cond.add(int(middle_id))
+    middle_frames = sorted(stage2_init_cond - stage1_init_cond)
+    frames_not_in_init_cond = [t for t in range(gt_zyx.shape[0]) if t not in stage2_init_cond]
+    processing_order = middle_frames + [
+        t for t in frames_not_in_init_cond if t not in set(middle_frames)
+    ]
+
+    pred_stage2 = _propagate_in_custom_order(
+        state=state,
+        predictor=predictor,
+        processing_order=processing_order,
+        pred_init=pred_stage1,
+        obj_id=obj_id,
+    )
     return pred_stage1, pred_stage2, middle_id
 
 
