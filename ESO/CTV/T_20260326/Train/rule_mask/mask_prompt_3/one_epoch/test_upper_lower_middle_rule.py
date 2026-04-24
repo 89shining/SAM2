@@ -145,13 +145,10 @@ def patient_id_from_folder(pdir: Path):
 def resolve_ckpt(finetuned_ckpt: Path, train_output_root: Path) -> Path:
     """
     Priority:
-    1) explicit --finetuned-ckpt if exists
-    2) best fold from best_fold.txt under train_output_root
+    1) best fold from best_fold.txt under train_output_root
+    2) explicit --finetuned-ckpt if exists
     3) DEFAULT_FINETUNED_CKPT
     """
-    if finetuned_ckpt.exists():
-        return finetuned_ckpt
-
     best_fold_txt = train_output_root / "best_fold.txt"
     if best_fold_txt.exists():
         content = best_fold_txt.read_text(encoding="utf-8", errors="ignore")
@@ -160,6 +157,9 @@ def resolve_ckpt(finetuned_ckpt: Path, train_output_root: Path) -> Path:
             best_ckpt = Path(m.group(1).strip())
             if best_ckpt.exists():
                 return best_ckpt
+
+    if finetuned_ckpt.exists():
+        return finetuned_ckpt
 
     if DEFAULT_FINETUNED_CKPT.exists():
         return DEFAULT_FINETUNED_CKPT

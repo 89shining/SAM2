@@ -143,27 +143,59 @@ def infer_two_stage_iterative_with_rule_middle(
     pred_stage2 = np.zeros((z, h, w), dtype=np.uint8)
     # Stage-2 two-pass middle-out propagation:
     # pass-A from middle to higher slices, then pass-B from middle to lower slices.
+    stage2_forward_written = set()
     for fidx, obj_ids, logits in predictor.propagate_in_video(
         state,
         start_frame_idx=int(middle_id),
         max_frame_num_to_track=z,
         reverse=False,
     ):
+        print("[DEBUG stage2 forward] fidx:", fidx)
         for i, oid in enumerate(obj_ids):
             if int(oid) == obj_id:
                 pred_stage2[int(fidx)] = (logits[i] > 0).cpu().numpy()
+                stage2_forward_written.add(int(fidx))
                 break
 
+    print(
+        "[DEBUG stage2] forward updated frames:",
+        sorted(stage2_forward_written),
+    )
+
+    stage2_reverse_written = set()
     for fidx, obj_ids, logits in predictor.propagate_in_video(
         state,
         start_frame_idx=int(middle_id),
         max_frame_num_to_track=z,
         reverse=True,
     ):
+        print("[DEBUG stage2 reverse] fidx:", fidx)
         for i, oid in enumerate(obj_ids):
             if int(oid) == obj_id:
                 pred_stage2[int(fidx)] = (logits[i] > 0).cpu().numpy()
+                stage2_reverse_written.add(int(fidx))
                 break
+    print(
+        "[DEBUG stage2] reverse updated frames:",
+        sorted(stage2_reverse_written),
+    )
+    print(
+        "[DEBUG stage2] union(updated frames):",
+        sorted(stage2_forward_written.union(stage2_reverse_written)),
+    )
+    print("[DEBUG] pred_stage1 sum:", pred_stage1.sum())
+    print("[DEBUG] pred_stage2 sum:", pred_stage2.sum())
+    print(
+        "[DEBUG] pred diff sum:",
+        np.abs(pred_stage2.astype(np.int32) - pred_stage1.astype(np.int32)).sum(),
+    )
+    for z in range(pred_stage1.shape[0]):
+        d = np.abs(pred_stage2[z].astype(np.int32) - pred_stage1[z].astype(np.int32)).sum()
+        if d > 0:
+            print(
+                f"[DEBUG] changed frame {z}: diff={d}, "
+                f"stage1_sum={pred_stage1[z].sum()}, stage2_sum={pred_stage2[z].sum()}"
+            )
     return pred_stage1, pred_stage2
 
 
@@ -286,8 +318,15 @@ def main():
                 middle_id=middle_id,
                 obj_id=args.obj_id,
             )
+            print("[DEBUG main] pred_stage1 sum:", pred_stage1.sum())
+            print("[DEBUG main] pred_stage2 sum:", pred_stage2.sum())
+            print(
+                "[DEBUG main] pred diff sum:",
+                np.abs(pred_stage2.astype(np.int32) - pred_stage1.astype(np.int32)).sum(),
+            )
             dice_stage1 = dice_3d(pred_stage1, gt_zyx)
             dice_stage2 = dice_3d(pred_stage2, gt_zyx)
+            print("[DEBUG save] saving pred_stage2, sum:", pred_stage2.sum())
             write_mask_like(pred_stage2, img_sitk, out_mask_path)
             print(
                 f"[OK] {patient_id}: stage1_dice={dice_stage1:.4f}, "
