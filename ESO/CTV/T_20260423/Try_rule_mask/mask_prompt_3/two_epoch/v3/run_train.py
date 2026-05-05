@@ -10,7 +10,7 @@ from pathlib import Path
 
 # ================= Centralized Paths =================
 DEFAULT_DATA_ROOT = Path("/home/wusi/SAM2/SAM2data/Eso/20260326/datanii")
-DEFAULT_EXP_ROOT = Path("/home/wusi/SAM2/SAM2data/Eso/20260423/Train/rule_mask/mask_prompt_3/two_epoch/v2")
+DEFAULT_EXP_ROOT = Path("/home/wusi/SAM2/SAM2data/Eso/20260423/Train/Try_rule_mask/mask_prompt_3/two_epoch/v3")
 DEFAULT_MODEL_CFG = "configs/sam2.1/sam2.1_hiera_l.yaml"
 DEFAULT_INIT_TRAIN_OUTPUT_ROOT = Path("/home/wusi/SAM2/SAM2data/Eso/20260326/Train/oracle_mask/mask_prompt_2/TrainResult")
 

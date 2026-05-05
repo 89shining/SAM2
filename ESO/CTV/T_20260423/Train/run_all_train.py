@@ -35,7 +35,7 @@ def build_common_args(args):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Run rule_mask and oracle_mask training+testing sequentially with auto-resume support."
+        description="Run Try_rule_mask and oracle_mask training+testing sequentially with auto-resume support."
     )
     parser.add_argument("--python", type=str, default=sys.executable, help="python executable")
     parser.add_argument("--only", type=str, default="both", choices=["both", "rule", "oracle"])
@@ -56,7 +56,7 @@ def main():
     args = parser.parse_args()
 
     train_root = Path(__file__).resolve().parent
-    rule_script = train_root / "rule_mask" / "run_train.py"
+    rule_script = train_root / "Try_rule_mask" / "run_train.py"
     oracle_script = train_root / "oracle_mask" / "run_train.py"
 
     if not rule_script.exists():
@@ -70,9 +70,9 @@ def main():
         cmd = [args.python, str(rule_script)] + common_args
         if args.rule_exp_root is not None:
             cmd += ["--exp-root", str(args.rule_exp_root)]
-        print("\n[1/2] rule_mask start", flush=True)
+        print("\n[1/2] Try_rule_mask start", flush=True)
         run_cmd(cmd, cwd=train_root)
-        print("[1/2] rule_mask done", flush=True)
+        print("[1/2] Try_rule_mask done", flush=True)
 
     if args.only in ("both", "oracle"):
         cmd = [args.python, str(oracle_script)] + common_args

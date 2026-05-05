@@ -9,10 +9,10 @@ import sys
 from pathlib import Path
 
 DEFAULT_DATA_ROOT = Path("/home/wusi/SAM2/SAM2data/Eso/20260326/datanii")
-DEFAULT_EXP_ROOT = Path("/home/wusi/SAM2/SAM2data/Eso/20260423/Train/rule_mask/k2_to_k10_one_shot")
+DEFAULT_EXP_ROOT = Path("/home/wusi/SAM2/SAM2data/Eso/20260423/Train/Try_rule_mask/k2_to_k10_one_shot")
 DEFAULT_MODEL_CFG = "configs/sam2.1/sam2.1_hiera_l.yaml"
 DEFAULT_PRETRAINED_CKPT = Path("/home/wusi/SAM2/checkpoints/sam2.1_hiera_large.pt")
-DEFAULT_PROMPT_XLSX = Path("/home/wusi/SAM2/SAM2data/Eso/20260423/Zero-shot/rule_mask/mask_prompt/uniform_prompt_slices_k2_to_k10.xlsx")
+DEFAULT_PROMPT_XLSX = Path("/home/wusi/SAM2/SAM2data/Eso/20260423/Zero-shot/Try_rule_mask/mask_prompt/uniform_prompt_slices_k2_to_k10.xlsx")
 
 
 def run_cmd(cmd, env=None, cwd=None):

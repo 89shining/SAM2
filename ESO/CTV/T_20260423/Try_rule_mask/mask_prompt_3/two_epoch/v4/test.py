@@ -77,12 +77,8 @@ def gt_positive_slices(gt_zyx: np.ndarray):
     return [int(z) for z in non_empty.tolist()]
 
 
-def choose_middle_rule(middle_candidates):
-    # Same as Inference/Try_rule_mask/mask_prompt_rule.py
-    if len(middle_candidates) == 0:
-        return None
-    cands = sorted(int(x) for x in middle_candidates)
-    return int(cands[len(cands) // 2])
+def choose_middle_midpoint(lower_id: int, upper_id: int) -> int:
+    return int((int(lower_id) + int(upper_id)) // 2)
 
 
 def relative_pos_upper_to_lower(slice_id: int, lower_id: int, upper_id: int):
@@ -98,12 +94,15 @@ def propagate_in_custom_order(
     processing_order,
     obj_id: int,
     pred_init: np.ndarray,
+    prev_sam_mask_logits_by_frame=None,
 ):
     # Mirror predictor.propagate_in_video internals, but use explicit processing_order.
     predictor.propagate_in_video_preflight(state)
     obj_ids = state["obj_ids"]
     batch_size = predictor._get_obj_num(state)
     pred = pred_init.copy()
+    pred_logits_by_frame = {}
+    prev_sam_mask_logits_by_frame = prev_sam_mask_logits_by_frame or {}
 
     for frame_idx in processing_order:
         pred_masks_per_obj = [None] * batch_size
@@ -120,6 +119,7 @@ def propagate_in_custom_order(
                     )
             else:
                 storage_key = "non_cond_frame_outputs"
+                prev_sam_mask_logits = prev_sam_mask_logits_by_frame.get(int(frame_idx), None)
                 current_out, pred_masks = predictor._run_single_frame_inference(
                     inference_state=state,
                     output_dict=obj_output_dict,
@@ -130,6 +130,7 @@ def propagate_in_custom_order(
                     mask_inputs=None,
                     reverse=False,
                     run_mem_encoder=True,
+                    prev_sam_mask_logits=prev_sam_mask_logits,
                 )
                 obj_output_dict[storage_key][frame_idx] = current_out
 
@@ -145,13 +146,18 @@ def propagate_in_custom_order(
         for i, oid in enumerate(obj_ids):
             if int(oid) == obj_id:
                 pred[int(frame_idx)] = (video_res_masks[i] > 0).cpu().numpy()
+                pred_logits_by_frame[int(frame_idx)] = torch.clamp(
+                    all_pred_masks[i:i + 1].detach(),
+                    -32.0,
+                    32.0,
+                )
                 break
 
-    return pred
+    return pred, pred_logits_by_frame
 
 
 @torch.no_grad()
-def infer_two_stage_iterative_with_rule_middle(
+def infer_two_stage_midpoint_with_prev_mask(
     predictor,
     frame_dir: Path,
     gt_zyx: np.ndarray,
@@ -160,14 +166,19 @@ def infer_two_stage_iterative_with_rule_middle(
     middle_id: int,
     obj_id: int,
 ):
+    z, h, w = gt_zyx.shape
+    all_frames = list(range(z))
+
+    # -------------------------
+    # Stage-1: upper/lower only -> P0
+    # -------------------------
     state = predictor.init_state(video_path=str(frame_dir))
     predictor.reset_state(state)
 
-    # Stage-1: upper/lower only
     stage1_prompt_ids = [int(upper_id)]
     if int(lower_id) != int(upper_id):
         stage1_prompt_ids.append(int(lower_id))
-    stage1_prompt_ids = list(dict.fromkeys(stage1_prompt_ids))
+    stage1_prompt_ids = sorted(list(dict.fromkeys(stage1_prompt_ids)))
     for sid in stage1_prompt_ids:
         prompt_mask = (gt_zyx[sid] > 0).astype(np.uint8)
         if prompt_mask.sum() == 0:
@@ -178,44 +189,52 @@ def infer_two_stage_iterative_with_rule_middle(
             obj_id=obj_id,
             mask=prompt_mask,
         )
-
-    z, h, w = gt_zyx.shape
     pred_stage1 = np.zeros((z, h, w), dtype=np.uint8)
-    for fidx, obj_ids, logits in predictor.propagate_in_video(state):
-        for i, oid in enumerate(obj_ids):
-            if int(oid) == obj_id:
-                pred_stage1[int(fidx)] = (logits[i] > 0).cpu().numpy()
-                break
-
-    # Stage-2: inherit stage-1 memory and inject middle prompt
-    stage1_init_cond = set(stage1_prompt_ids)
-    if int(middle_id) not in stage1_prompt_ids:
-        mid_mask = (gt_zyx[int(middle_id)] > 0).astype(np.uint8)
-        if mid_mask.sum() == 0:
-            raise RuntimeError(f"Prompt slice {middle_id} is empty in GT.")
-        predictor.add_new_mask(
-            inference_state=state,
-            frame_idx=int(middle_id),
-            obj_id=obj_id,
-            mask=mid_mask,
-        )
-
-    stage2_init_cond = set(stage1_prompt_ids)
-    if int(middle_id) not in stage1_init_cond:
-        stage2_init_cond.add(int(middle_id))
-    middle_frames = sorted(stage2_init_cond - stage1_init_cond)
-    frames_not_in_init_cond = [t for t in range(z) if t not in stage2_init_cond]
-    processing_order = middle_frames + [
-        t for t in frames_not_in_init_cond if t not in set(middle_frames)
-    ]
-
-    pred_stage2 = propagate_in_custom_order(
+    processing_order_stage1 = stage1_prompt_ids + [t for t in all_frames if t not in set(stage1_prompt_ids)]
+    pred_stage1, pred_logits_stage1 = propagate_in_custom_order(
         predictor=predictor,
         state=state,
-        processing_order=processing_order,
+        processing_order=processing_order_stage1,
         obj_id=obj_id,
         pred_init=pred_stage1,
+        prev_sam_mask_logits_by_frame=None,
     )
+
+    # -------------------------
+    # Stage-2: fresh state + upper/lower/middle prompts + P0 as previous mask
+    # -------------------------
+    state = predictor.init_state(video_path=str(frame_dir))
+    predictor.reset_state(state)
+
+    stage2_prompt_ids = [int(upper_id)]
+    if int(lower_id) != int(upper_id):
+        stage2_prompt_ids.append(int(lower_id))
+    if int(middle_id) not in stage2_prompt_ids:
+        stage2_prompt_ids.append(int(middle_id))
+    stage2_prompt_ids = sorted(list(dict.fromkeys(stage2_prompt_ids)))
+
+    for sid in stage2_prompt_ids:
+        prompt_mask = (gt_zyx[sid] > 0).astype(np.uint8)
+        if prompt_mask.sum() == 0:
+            raise RuntimeError(f"Prompt slice {sid} is empty in GT.")
+        predictor.add_new_mask(
+            inference_state=state,
+            frame_idx=int(sid),
+            obj_id=obj_id,
+            mask=prompt_mask,
+        )
+
+    processing_order_stage2 = stage2_prompt_ids + [t for t in all_frames if t not in set(stage2_prompt_ids)]
+    pred_stage2 = np.zeros((z, h, w), dtype=np.uint8)
+    pred_stage2, _ = propagate_in_custom_order(
+        predictor=predictor,
+        state=state,
+        processing_order=processing_order_stage2,
+        obj_id=obj_id,
+        pred_init=pred_stage2,
+        prev_sam_mask_logits_by_frame=pred_logits_stage1,
+    )
+
     return pred_stage1, pred_stage2
 
 
@@ -251,7 +270,7 @@ def resolve_ckpt(finetuned_ckpt, train_output_root: Path) -> Path:
 
 
 def main():
-    parser = argparse.ArgumentParser("Test SAM2 with upper/lower/rule-middle mask prompts")
+    parser = argparse.ArgumentParser("Test SAM2 with two-pass midpoint prompts and detached previous-mask refinement")
     parser.add_argument("--test-root", type=Path, required=True, help="Separate test set root")
     parser.add_argument("--output-root", type=Path, required=True, help="Save root for masks/excel")
     parser.add_argument("--finetuned-ckpt", type=Path, default=None, help="Optional checkpoint for inference fallback")
@@ -263,7 +282,7 @@ def main():
     parser.add_argument("--window-center", type=float, default=40.0)
     parser.add_argument("--window-width", type=float, default=400.0)
     parser.add_argument("--device", type=str, default="cuda")
-    parser.add_argument("--excel-name", type=str, default="prompt_layer_search_rule_middle.xlsx")
+    parser.add_argument("--excel-name", type=str, default="two_pass_midpoint_prev_mask.xlsx")
     args = parser.parse_args()
 
     if not args.test_root.exists():
@@ -271,8 +290,10 @@ def main():
     ckpt_path = resolve_ckpt(args.finetuned_ckpt, args.train_output_root)
 
     args.output_root.mkdir(parents=True, exist_ok=True)
-    best_mask_dir = args.output_root / "best_mask"
-    best_mask_dir.mkdir(parents=True, exist_ok=True)
+    mask_stage1_dir = args.output_root / "mask_stage1_p0"
+    mask_stage2_dir = args.output_root / "mask_stage2_p1_final"
+    mask_stage1_dir.mkdir(parents=True, exist_ok=True)
+    mask_stage2_dir.mkdir(parents=True, exist_ok=True)
     out_xlsx = args.output_root / args.excel_name
 
     device = torch.device(
@@ -289,11 +310,13 @@ def main():
     print(f"[INFO] Found {len(patient_dirs)} patients")
 
     all_rows = []
-    best_rows = []
+    dice_stage1_all = []
+    dice_stage2_all = []
 
     for pdir in patient_dirs:
         patient_id = patient_id_from_folder(pdir)
-        out_mask_path = best_mask_dir / f"{patient_id}.nii.gz"
+        out_mask_stage1 = mask_stage1_dir / f"{patient_id}.nii.gz"
+        out_mask_stage2 = mask_stage2_dir / f"{patient_id}.nii.gz"
         img_path = pdir / args.img_name
         gt_path = pdir / args.gt_name
 
@@ -316,10 +339,7 @@ def main():
 
         lower_id = int(min(pos))
         upper_id = int(max(pos))
-        middle_candidates = [z for z in pos if lower_id < z < upper_id]
-        middle_id = choose_middle_rule(middle_candidates)
-        if middle_id is None:
-            middle_id = lower_id
+        middle_id = choose_middle_midpoint(lower_id=lower_id, upper_id=upper_id)
 
         rel = relative_pos_upper_to_lower(middle_id, lower_id, upper_id)
         print(
@@ -329,7 +349,7 @@ def main():
         tmp_dir = Path(tempfile.mkdtemp(prefix=f"sam2_test_{pdir.name}_"))
         try:
             save_frames_from_volume(img_zyx, tmp_dir, args.window_center, args.window_width)
-            pred_stage1, pred_stage2 = infer_two_stage_iterative_with_rule_middle(
+            pred_stage1, pred_stage2 = infer_two_stage_midpoint_with_prev_mask(
                 predictor=predictor,
                 frame_dir=tmp_dir,
                 gt_zyx=gt_zyx,
@@ -340,11 +360,14 @@ def main():
             )
             dice_stage1 = dice_3d(pred_stage1, gt_zyx)
             dice_stage2 = dice_3d(pred_stage2, gt_zyx)
-            write_mask_like(pred_stage2, img_sitk, out_mask_path)
+            write_mask_like(pred_stage1, img_sitk, out_mask_stage1)
+            write_mask_like(pred_stage2, img_sitk, out_mask_stage2)
             print(
                 f"[OK] {patient_id}: stage1_dice={dice_stage1:.4f}, "
-                f"stage2_dice={dice_stage2:.4f} -> {out_mask_path}"
+                f"stage2_dice={dice_stage2:.4f} | P0->{out_mask_stage1} | P1->{out_mask_stage2}"
             )
+            dice_stage1_all.append(float(dice_stage1))
+            dice_stage2_all.append(float(dice_stage2))
 
             all_rows.append(
                 {
@@ -352,20 +375,12 @@ def main():
                     "Prompt_Slice_ID": f"{upper_id},{lower_id},{middle_id}",
                     "Lower_Bound_ID": lower_id,
                     "Upper_Bound_ID": upper_id,
+                    "Middle_ID": middle_id,
                     "Prompt_Rel_Pos_UpperToLower": rel,
                     "Dice3D_Stage1": dice_stage1,
                     "Dice3D_Stage2": dice_stage2,
-                }
-            )
-            best_rows.append(
-                {
-                    "Patient_ID": patient_id,
-                    "Best_Prompt_Slice_ID": middle_id,
-                    "Lower_Bound_ID": lower_id,
-                    "Upper_Bound_ID": upper_id,
-                    "Best_Prompt_Rel_Pos_UpperToLower": rel,
-                    "Best_Dice3D_Stage1": dice_stage1,
-                    "Best_Dice3D_Stage2": dice_stage2,
+                    "Mask_Stage1_Path": str(out_mask_stage1),
+                    "Mask_Stage2_Path": str(out_mask_stage2),
                 }
             )
         finally:
@@ -376,20 +391,21 @@ def main():
         return int(mm.group(1)) if mm else 10**9
 
     all_rows.sort(key=_pid_key)
-    best_rows.sort(key=_pid_key)
-
     wb = Workbook()
     ws_all = wb.active
-    ws_all.title = "All_Prompt_Search"
+    ws_all.title = "Per_Patient"
     ws_all.append(
         [
             "Patient_ID",
             "Prompt_Slice_ID",
             "Lower_Bound_ID",
             "Upper_Bound_ID",
+            "Middle_ID",
             "Prompt_Rel_Pos_UpperToLower",
             "Dice3D_Stage1",
             "Dice3D_Stage2",
+            "Mask_Stage1_Path",
+            "Mask_Stage2_Path",
         ]
     )
     for r in all_rows:
@@ -399,40 +415,24 @@ def main():
                 r["Prompt_Slice_ID"],
                 int(r["Lower_Bound_ID"]),
                 int(r["Upper_Bound_ID"]),
+                int(r["Middle_ID"]),
                 round(float(r["Prompt_Rel_Pos_UpperToLower"]), 6),
                 round(float(r["Dice3D_Stage1"]), 6),
                 round(float(r["Dice3D_Stage2"]), 6),
-            ]
-        )
-
-    ws_best = wb.create_sheet("Best_Per_Patient")
-    ws_best.append(
-        [
-            "Patient_ID",
-            "Best_Prompt_Slice_ID",
-            "Lower_Bound_ID",
-            "Upper_Bound_ID",
-            "Best_Prompt_Rel_Pos_UpperToLower",
-            "Best_Dice3D_Stage1",
-            "Best_Dice3D_Stage2",
-        ]
-    )
-    for r in best_rows:
-        ws_best.append(
-            [
-                r["Patient_ID"],
-                int(r["Best_Prompt_Slice_ID"]),
-                int(r["Lower_Bound_ID"]),
-                int(r["Upper_Bound_ID"]),
-                round(float(r["Best_Prompt_Rel_Pos_UpperToLower"]), 6),
-                round(float(r["Best_Dice3D_Stage1"]), 6),
-                round(float(r["Best_Dice3D_Stage2"]), 6),
+                r["Mask_Stage1_Path"],
+                r["Mask_Stage2_Path"],
             ]
         )
 
     wb.save(str(out_xlsx))
+    if len(dice_stage1_all) > 0:
+        print(
+            f"[SUMMARY] mean_stage1_dice={np.mean(dice_stage1_all):.4f}, "
+            f"mean_stage2_dice={np.mean(dice_stage2_all):.4f}"
+        )
     print(f"[DONE] Excel saved: {out_xlsx}")
-    print(f"[DONE] Masks saved in: {best_mask_dir}")
+    print(f"[DONE] Stage1 masks (P0) saved in: {mask_stage1_dir}")
+    print(f"[DONE] Stage2 masks (P1 final) saved in: {mask_stage2_dir}")
 
 
 if __name__ == "__main__":

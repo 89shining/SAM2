@@ -34,7 +34,7 @@ from sam2.build_sam import build_sam2_video_predictor
 # ======================================================
 
 DATA_ROOT = Path(
-    "/home/wusi/SAMdata/Eso/20260104_CTV/nnUNet_mask/cropdatanii/test_nii"
+    "/home/wusi/SAMdata/Eso/20260104_CTV/nnUNet/cropdatanii/test_nii"
 )
 
 OUT_DIR = Path(

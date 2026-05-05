@@ -3,7 +3,7 @@
 """
 SAM2 finetuning with iterative two-stage prompting (rule middle):
   pass-1: upper + lower prompts
-  middle slice: rule-based (same source as rule_mask/mask_prompt_3/one_epoch)
+  middle slice: rule-based (same source as Try_rule_mask/mask_prompt_3/one_epoch)
   pass-2: continue from pass-1 memory and inject middle prompt
 
 Example:

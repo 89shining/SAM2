@@ -39,17 +39,17 @@ except ImportError as exc:
 DEFAULT_DATA_ROOT = Path("/home/wusi/SAM2/SAM2data/Eso/20260108/Data83")
 DEFAULT_PRED_BOUNDARY_DIR = Path("/home/wusi/SAM2/SAM2data/Eso/20260326/zero-shot/oracle_mask/mask_prompt_2/best_mask")
 
-DEFAULT_RULE_MIDDLE_DIR = Path("/home/wusi/SAM2/SAM2data/Eso/20260326/zero-shot/rule_mask/rule_middle_mask")
-DEFAULT_RULE_MAXAREA_DIR = Path("/home/wusi/SAM2/SAM2data/Eso/20260326/zero-shot/rule_mask/rule_maxarea_mask")
+DEFAULT_RULE_MIDDLE_DIR = Path("/home/wusi/SAM2/SAM2data/Eso/20260326/zero-shot/Try_rule_mask/rule_middle_mask")
+DEFAULT_RULE_MAXAREA_DIR = Path("/home/wusi/SAM2/SAM2data/Eso/20260326/zero-shot/Try_rule_mask/rule_maxarea_mask")
 # NOTE: this name follows your current mask_prompt_rule.py output folder.
-DEFAULT_RULE_MAXCHANGE_DIR = Path("/home/wusi/SAM2/SAM2data/Eso/20260326/zero-shot/rule_mask/rule_maxarea_change_mask")
+DEFAULT_RULE_MAXCHANGE_DIR = Path("/home/wusi/SAM2/SAM2data/Eso/20260326/zero-shot/Try_rule_mask/rule_maxarea_change_mask")
 
 DEFAULT_PROMPT2_EXCEL = Path("/home/wusi/SAM2/SAM2data/Eso/20260326/zero-shot/oracle_mask/mask_prompt_2/prompt_layer_search2.xlsx")
-DEFAULT_RULE_SUMMARY_XLSX = Path("/home/wusi/SAM2/SAM2data/Eso/20260326/zero-shot/rule_mask/prompt_rule_summary.xlsx")
+DEFAULT_RULE_SUMMARY_XLSX = Path("/home/wusi/SAM2/SAM2data/Eso/20260326/zero-shot/Try_rule_mask/prompt_rule_summary.xlsx")
 
-DEFAULT_OUT_MIDDLE = Path("/home/wusi/SAM2/SAM2data/Eso/20260326/zero-shot/rule_mask/eval_boundary_vs_rule_middle.xlsx")
-DEFAULT_OUT_MAXAREA = Path("/home/wusi/SAM2/SAM2data/Eso/20260326/zero-shot/rule_mask/eval_boundary_vs_rule_maxarea.xlsx")
-DEFAULT_OUT_MAXCHANGE = Path("/home/wusi/SAM2/SAM2data/Eso/20260326/zero-shot/rule_mask/eval_boundary_vs_rule_maxchange.xlsx")
+DEFAULT_OUT_MIDDLE = Path("/home/wusi/SAM2/SAM2data/Eso/20260326/zero-shot/Try_rule_mask/eval_boundary_vs_rule_middle.xlsx")
+DEFAULT_OUT_MAXAREA = Path("/home/wusi/SAM2/SAM2data/Eso/20260326/zero-shot/Try_rule_mask/eval_boundary_vs_rule_maxarea.xlsx")
+DEFAULT_OUT_MAXCHANGE = Path("/home/wusi/SAM2/SAM2data/Eso/20260326/zero-shot/Try_rule_mask/eval_boundary_vs_rule_maxchange.xlsx")
 
 
 def normalize_id(value) -> str:

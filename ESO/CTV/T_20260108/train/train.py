@@ -39,7 +39,7 @@ from sam2.build_sam import build_sam2
 # =========================
 # Config
 # =========================
-ROOT_DIR = Path("/home/wusi/SAMdata/Eso/20260104_CTV/nnUNet_mask/cropdatanii/train_nii")
+ROOT_DIR = Path("/home/wusi/SAMdata/Eso/20260104_CTV/nnUNet/cropdatanii/train_nii")
 
 SAM2_CONFIG = "configs/sam2.1/sam2.1_hiera_b+.yaml"
 SAM2_CKPT   = "/home/wusi/sam2/checkpoints/sam2.1_hiera_base_plus.pt"

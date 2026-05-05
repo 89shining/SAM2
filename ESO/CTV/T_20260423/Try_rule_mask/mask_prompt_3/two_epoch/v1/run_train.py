@@ -3,13 +3,14 @@
 
 import argparse
 import os
+import socket
 import subprocess
 import sys
 from pathlib import Path
 
 # ================= Centralized Paths =================
 DEFAULT_DATA_ROOT = Path("/home/wusi/SAM2/SAM2data/Eso/20260326/datanii")
-DEFAULT_EXP_ROOT = Path("/home/wusi/SAM2/SAM2data/Eso/20260326/Train/Try_rule_mask/mask_prompt_3/two_epoch")
+DEFAULT_EXP_ROOT = Path("/home/wusi/SAM2/SAM2data/Eso/20260423/Train/Try_rule_mask/mask_prompt_3/two_epoch/v1")
 DEFAULT_MODEL_CFG = "configs/sam2.1/sam2.1_hiera_l.yaml"
 DEFAULT_INIT_TRAIN_OUTPUT_ROOT = Path("/home/wusi/SAM2/SAM2data/Eso/20260326/Train/oracle_mask/mask_prompt_2/TrainResult")
 
@@ -21,12 +22,25 @@ def run_cmd(cmd, env=None, cwd=None):
         raise RuntimeError(f"Command failed (exit={result.returncode}): {' '.join(cmd)}")
 
 
+def pick_free_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("", 0))
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        return int(s.getsockname()[1])
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Run rule-mask two-epoch iterative training then testing (auto-resume enabled)."
     )
-    parser.add_argument("--gpu", type=str, default="5", help="CUDA_VISIBLE_DEVICES value")
+    parser.add_argument("--gpu", type=str, default="4", help="CUDA_VISIBLE_DEVICES value")
     parser.add_argument("--nproc-per-node", type=int, default=1, help="torchrun nproc per node")
+    parser.add_argument(
+        "--master-port",
+        type=int,
+        default=0,
+        help="torchrun master port. 0 means auto-pick a free port.",
+    )
     parser.add_argument("--torchrun", type=str, default="torchrun", help="torchrun executable")
     parser.add_argument("--python", type=str, default=sys.executable, help="python executable for test")
     parser.add_argument("--train-script", type=str, default="train.py", help="training script filename")
@@ -63,11 +77,14 @@ def main():
     test_root = args.data_root / args.test_subdir
     train_output_root = args.exp_root / "TrainResult"
     test_output_root = args.exp_root / "TestResult"
+    master_port = int(args.master_port) if int(args.master_port) > 0 else pick_free_port()
 
     train_cmd = [
         args.torchrun,
         "--nproc_per_node",
         str(args.nproc_per_node),
+        "--master_port",
+        str(master_port),
         str(train_script),
         "--train-root",
         str(train_root),
@@ -106,6 +123,7 @@ def main():
     print(f"[INFO] init_train_output_root={args.init_train_output_root}", flush=True)
     print(f"[INFO] stage1_loss_weight={args.stage1_loss_weight}", flush=True)
     print(f"[INFO] stage2_loss_weight={args.stage2_loss_weight}", flush=True)
+    print(f"[INFO] master_port={master_port}", flush=True)
     print("[INFO] Resume policy: ON (always pass --resume)", flush=True)
 
     print("[1/2] Training (iterative + auto-resume)", flush=True)

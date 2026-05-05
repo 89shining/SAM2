@@ -37,7 +37,7 @@ from sam2.build_sam import build_sam2_video_predictor
 # ======================================================
 
 DATA_ROOT = Path("/home/wusi/SAM2/SAM2data/Eso/20260108/Data83")
-OUT_ROOT = Path("/home/wusi/SAM2/SAM2data/Eso/20260423/Zero-shot/rule_mask/mask_prompt")
+OUT_ROOT = Path("/home/wusi/SAM2/SAM2data/Eso/20260423/Zero-shot/Try_rule_mask/mask_prompt")
 OUT_XLSX = OUT_ROOT / "uniform_prompt_slices_k2_to_k10.xlsx"
 
 IMG_NAME = "image.nii.gz"

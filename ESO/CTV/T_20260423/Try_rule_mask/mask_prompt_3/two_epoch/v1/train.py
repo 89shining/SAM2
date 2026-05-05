@@ -3,7 +3,7 @@
 """
 SAM2 finetuning with iterative two-stage prompting (rule middle):
   pass-1: upper + lower prompts
-  middle slice: rule-based (same source as rule_mask/mask_prompt_3/one_epoch)
+  middle slice: rule-based (same source as Try_rule_mask/mask_prompt_3/one_epoch)
   pass-2: continue from pass-1 memory and inject middle prompt
 
 Example:
@@ -536,46 +536,6 @@ def select_rule_middle_from_gt(batch_masks: torch.Tensor, unique_objects_identif
         runtime_map[video_id] = int(middle_candidates[len(middle_candidates) // 2])
     return runtime_map
 
-
-def _collect_lower_upper_middle_debug_rows(
-    batch_masks: torch.Tensor,
-    unique_objects_identifier,
-    runtime_middle_map,
-):
-    # Support both [T,O,H,W] and [T,O,1,H,W] masks from different collate paths.
-    masks = batch_masks.detach().bool()
-    if masks.ndim == 5 and masks.shape[2] == 1:
-        masks = masks[:, :, 0]
-    elif masks.ndim != 4:
-        raise ValueError(f"Expected batch_masks to be [T,O,H,W] or [T,O,1,H,W], got {tuple(masks.shape)}")
-
-    gt_vols = masks.cpu().numpy()
-    t_dim, o_dim, _, _ = gt_vols.shape
-    rows = []
-    for o in range(o_dim):
-        video_id = int(unique_objects_identifier[0, o, 0].item())
-        gt_o = gt_vols[:, o]
-        pos = np.where(gt_o.reshape(t_dim, -1).any(axis=1))[0]
-        if len(pos) == 0:
-            lower = 0
-            upper = 0
-        else:
-            lower = int(pos.min())
-            upper = int(pos.max())
-        middle = int(runtime_middle_map.get(video_id, lower))
-        rows.append(
-            {
-                "video_id": video_id,
-                "lower_id": lower,
-                "upper_id": upper,
-                "middle_id": middle,
-                "middle_eq_lower": middle == lower,
-                "middle_eq_upper": middle == upper,
-            }
-        )
-    return rows
-
-
 def ddp_enabled() -> bool:
     return dist.is_available() and dist.is_initialized()
 
@@ -620,7 +580,6 @@ def _forward_tracking_iterative(
     batch,
     output_dict=None,
     processing_order=None,
-    track_reverse_map=None,
 ):
     img_feats_already_computed = backbone_out["backbone_fpn"] is not None
     if img_feats_already_computed:
@@ -642,8 +601,6 @@ def _forward_tracking_iterative(
         }
     if processing_order is None:
         processing_order = init_cond_frames + backbone_out["frames_not_in_init_cond"]
-    if track_reverse_map is None:
-        track_reverse_map = {}
 
     for stage_id in processing_order:
         img_ids = batch.flat_obj_to_img_idx[stage_id]
@@ -672,7 +629,6 @@ def _forward_tracking_iterative(
             frames_to_add_correction_pt=frames_to_add_correction_pt,
             output_dict=output_dict,
             num_frames=num_frames,
-            track_in_reverse=bool(track_reverse_map.get(int(stage_id), False)),
         )
         add_output_as_cond_frame = stage_id in init_cond_frames or (
             core_model.add_all_frames_to_correct_as_cond
@@ -688,14 +644,7 @@ def _forward_tracking_iterative(
     return output_dict
 
 
-def _append_middle_prompts_inplace(
-    core_model,
-    base_backbone_out,
-    backbone_stage1,
-    batch,
-    debug_print: bool = False,
-    debug_prefix: str = "",
-):
+def _append_middle_prompts_inplace(core_model, base_backbone_out, backbone_stage1, batch):
     # Build stage-2 prompt layout, then append only the new middle prompts to stage-1 backbone_out.
     stage2_backbone = core_model.prepare_prompt_inputs(
         _clone_backbone_out(base_backbone_out), batch
@@ -703,15 +652,6 @@ def _append_middle_prompts_inplace(
     old_init = set(backbone_stage1["init_cond_frames"])
     new_init = set(stage2_backbone["init_cond_frames"])
     middle_frames = sorted(new_init - old_init)
-
-    if debug_print:
-        stage1_init_sorted = sorted(int(t) for t in old_init)
-        stage2_init_sorted = sorted(int(t) for t in new_init)
-        print(f"{debug_prefix} stage1 init: {stage1_init_sorted}")
-        print(f"{debug_prefix} stage2 init: {stage2_init_sorted}")
-        print(f"{debug_prefix} middle_frames: {middle_frames}")
-        if len(middle_frames) == 0:
-            print(f"{debug_prefix} [WARN] middle_frames is empty -> stage2 has no new prompt frame.")
 
     for t in middle_frames:
         if t in stage2_backbone["mask_inputs_per_frame"]:
@@ -722,37 +662,6 @@ def _append_middle_prompts_inplace(
     num_frames = int(backbone_stage1["num_frames"])
     backbone_stage1["frames_not_in_init_cond"] = [t for t in range(num_frames) if t not in set(merged_init)]
     return backbone_stage1, middle_frames
-
-
-def _build_stage2_two_pass_orders_and_direction(frames_not_in_init_cond, middle_frames):
-    """
-    Stage-2 two-pass order (aligned with v3 test):
-    - pass-A: middle frames first, then forward (higher frame indices)
-    - pass-B: middle frames first, then reverse (lower frame indices)
-    """
-    middle_frames = sorted(set(int(t) for t in middle_frames))
-    remain = sorted(set(int(t) for t in frames_not_in_init_cond))
-
-    if len(middle_frames) == 0:
-        forward_order = remain
-        reverse_order = list(reversed(remain))
-        return (
-            forward_order,
-            {int(t): False for t in forward_order},
-            reverse_order,
-            {int(t): True for t in reverse_order},
-        )
-
-    anchor_middle = int(middle_frames[len(middle_frames) // 2])
-    forward_remain = [int(t) for t in remain if int(t) > anchor_middle]
-    reverse_remain = [int(t) for t in remain if int(t) < anchor_middle]
-    reverse_remain = sorted(reverse_remain, reverse=True)
-
-    forward_order = middle_frames + forward_remain
-    reverse_order = middle_frames + reverse_remain
-    forward_reverse_map = {int(t): False for t in forward_order}
-    reverse_reverse_map = {int(t): True for t in reverse_order}
-    return forward_order, forward_reverse_map, reverse_order, reverse_reverse_map
 
 
 def is_main_process() -> bool:
@@ -851,8 +760,6 @@ def run_epoch_two_pass(
     stage2_loss_weight: float,
     forward_backbone_per_frame: bool = False,
     empty_cache_every: int = 0,
-    debug_two_stage: bool = False,
-    debug_max_batches: int = 1,
 ):
     model.train(train_mode)
     total_loss = 0.0
@@ -862,8 +769,6 @@ def run_epoch_two_pass(
     core_model = unwrap_model(model)
 
     for batch_idx, batch in enumerate(loader, start=1):
-        debug_this_batch = bool(debug_two_stage and is_main_process() and batch_idx <= int(debug_max_batches))
-        debug_prefix = f"[DEBUG][{'train' if train_mode else 'val'}][batch={batch_idx}]"
         if train_mode:
             # Free previous step gradients before forward to reduce peak memory.
             optimizer.zero_grad(set_to_none=True)
@@ -904,18 +809,6 @@ def run_epoch_two_pass(
             batch_masks=batch.masks,
             unique_objects_identifier=batch.metadata.unique_objects_identifier,
         )
-        if debug_this_batch:
-            print(f"{debug_prefix} runtime_middle_map: {runtime_middle_map}")
-            rows = _collect_lower_upper_middle_debug_rows(
-                batch_masks=batch.masks,
-                unique_objects_identifier=batch.metadata.unique_objects_identifier,
-                runtime_middle_map=runtime_middle_map,
-            )
-            for row in rows:
-                print(
-                    f"{debug_prefix} lower={row['lower_id']}, upper={row['upper_id']}, middle={row['middle_id']} "
-                    f"(video_id={row['video_id']}, middle==lower:{row['middle_eq_lower']}, middle==upper:{row['middle_eq_upper']})"
-                )
 
         # -------------------------
         # Pass-2 (iterative only): continue on stage-1 memory and inject middle prompt
@@ -927,58 +820,22 @@ def run_epoch_two_pass(
             dtype=amp_dtype,
         ):
             backbone_stage2, middle_frames = _append_middle_prompts_inplace(
-                core_model,
-                base_backbone_out,
-                backbone_stage1,
-                batch,
-                debug_print=debug_this_batch,
-                debug_prefix=debug_prefix,
+                core_model, base_backbone_out, backbone_stage1, batch
             )
-            (
-                processing_order_fwd,
-                track_reverse_map_fwd,
-                processing_order_rev,
-                track_reverse_map_rev,
-            ) = _build_stage2_two_pass_orders_and_direction(
-                frames_not_in_init_cond=backbone_stage2["frames_not_in_init_cond"],
-                middle_frames=middle_frames,
-            )
-            if debug_this_batch:
-                print(f"{debug_prefix} processing_order_fwd: {processing_order_fwd}")
-                print(f"{debug_prefix} processing_order_rev: {processing_order_rev}")
-                print(f"{debug_prefix} has_middle_in_fwd: {any(int(m) in set(processing_order_fwd) for m in middle_frames)}")
-                print(f"{debug_prefix} has_middle_in_rev: {any(int(m) in set(processing_order_rev) for m in middle_frames)}")
-                before_stage2_cond = sorted(int(k) for k in output_dict_stage1["cond_frame_outputs"].keys())
-                print(f"{debug_prefix} before stage2 cond: {before_stage2_cond}")
+            processing_order = middle_frames + [
+                t for t in backbone_stage2["frames_not_in_init_cond"]
+                if t not in set(middle_frames)
+            ]
             output_dict_stage2 = _forward_tracking_iterative(
                 core_model,
                 backbone_stage2,
                 batch,
                 output_dict=output_dict_stage1,
-                processing_order=processing_order_fwd,
-                track_reverse_map=track_reverse_map_fwd,
+                processing_order=processing_order
             )
-            output_dict_stage2 = _forward_tracking_iterative(
-                core_model,
-                backbone_stage2,
-                batch,
-                output_dict=output_dict_stage2,
-                processing_order=processing_order_rev,
-                track_reverse_map=track_reverse_map_rev,
-            )
-            if debug_this_batch:
-                after_stage2_cond = sorted(int(k) for k in output_dict_stage2["cond_frame_outputs"].keys())
-                print(f"{debug_prefix} after stage2 cond: {after_stage2_cond}")
             outputs_stage2 = _outputs_from_tracking_dict(
                 output_dict_stage2, backbone_stage2["num_frames"]
             )
-            if debug_this_batch:
-                for t in range(len(outputs_stage2)):
-                    diff = (
-                        outputs_stage2[t]["pred_masks_high_res"]
-                        - outputs_stage1[t]["pred_masks_high_res"]
-                    ).abs().sum()
-                    print(f"{debug_prefix} frame {t} diff: {float(diff.item()):.6f}")
             loss_stage2 = loss_fn(outputs_stage2, batch.masks)
             loss_raw = stage1_loss_weight * loss_stage1 + stage2_loss_weight * loss_stage2
             loss = loss_raw / (1.0 + loss_raw)
@@ -1100,17 +957,6 @@ def main():
         type=str,
         default="",
         help="Optional comma-separated fold ids to resume only, e.g. '2,3'. Empty means all folds.",
-    )
-    parser.add_argument(
-        "--debug-two-stage",
-        action="store_true",
-        help="Print detailed stage1/stage2 debug logs for a few batches.",
-    )
-    parser.add_argument(
-        "--debug-max-batches",
-        type=int,
-        default=1,
-        help="How many batches per epoch to print when --debug-two-stage is enabled.",
     )
     args = parser.parse_args()
 
@@ -1304,8 +1150,6 @@ def main():
                 stage2_loss_weight=args.stage2_loss_weight,
                 forward_backbone_per_frame=args.forward_backbone_per_frame,
                 empty_cache_every=args.empty_cache_every,
-                debug_two_stage=args.debug_two_stage,
-                debug_max_batches=args.debug_max_batches,
             )
 
             with torch.no_grad():
@@ -1322,8 +1166,6 @@ def main():
                     stage2_loss_weight=args.stage2_loss_weight,
                     forward_backbone_per_frame=args.forward_backbone_per_frame,
                     empty_cache_every=args.empty_cache_every,
-                    debug_two_stage=args.debug_two_stage,
-                    debug_max_batches=args.debug_max_batches,
                 )
 
             scheduler.step(va_dice)

@@ -7,7 +7,7 @@ class SAM2TrainUpperLowerMiddleRuleMask(SAM2Train):
     """
     Train/eval with mask prompts only:
     - For each object, automatically find GT-positive temporal bounds (lower/upper).
-    - Middle prompt follows rule_mask/mask_prompt_rule.py middle rule:
+    - Middle prompt follows Try_rule_mask/mask_prompt_rule.py middle rule:
       choose geometric middle among GT-positive middle layers (lower < z < upper);
       if no middle candidate, fallback to lower.
     - Use GT masks on upper + lower + middle frames as conditioning prompts.

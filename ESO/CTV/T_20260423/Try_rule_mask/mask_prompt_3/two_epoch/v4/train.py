@@ -1,13 +1,10 @@
 ﻿#!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
-SAM2 finetuning with iterative two-stage prompting (rule middle):
-  pass-1: upper + lower prompts
-  middle slice: rule-based (same source as rule_mask/mask_prompt_3/one_epoch)
-  pass-2: continue from pass-1 memory and inject middle prompt
-
-Example:
-CUDA_VISIBLE_DEVICES=0,1 torchrun --nproc_per_node=2 train_upper_lower_online_hd95_middle_cv.py
+SAM2 finetuning with two-pass prompting and detached previous-mask refinement:
+  pass-1: upper + lower GT mask prompts -> P0
+  pass-2: upper + lower + midpoint GT mask prompts + prev mask logits (P0.detach()) -> P1
+  loss: (loss(P0, GT) + loss(P1, GT)) / 2
 """
 
 import argparse
@@ -17,12 +14,12 @@ import os
 import random
 import re
 import sys
-from contextlib import nullcontext
 from pathlib import Path
 
 import numpy as np
 import SimpleITK as sitk
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 import torch.distributed as dist
 from hydra import compose, initialize_config_module
@@ -69,6 +66,7 @@ from training.utils.data_utils import Frame, Object, VideoDatapoint, collate_fn
 
 # ================= Defaults =================
 DEFAULT_MODEL_CFG = "configs/sam2.1/sam2.1_hiera_l.yaml"
+DEFAULT_INIT_CKPT = (PROJECT_ROOT / "checkpoints" / "sam2.1_hiera_large.pt").resolve()
 
 
 def set_seed(seed: int):
@@ -144,12 +142,11 @@ def patient_video_num_from_id(patient_id: str) -> int:
     return int(m.group(1))
 
 
-class SAM2TrainUpperLowerDynamicMiddleMask(SAM2Train):
+class SAM2TrainUpperLowerMidpointMask(SAM2Train):
     """
     Two-pass training/eval:
     - pass-1: boundary-only (upper + lower mask prompts)
-    - select middle frame online from pass-1 prediction
-    - pass-2: boundary + selected middle mask prompt
+    - pass-2: boundary + midpoint mask prompt
     """
 
     def __init__(self, *args, **kwargs):
@@ -171,38 +168,17 @@ class SAM2TrainUpperLowerDynamicMiddleMask(SAM2Train):
             )
         )
         super().__init__(*args, **kwargs)
-        self.runtime_middle_prompt_by_video_id = {}
         self.enable_middle_prompt = False
 
-    def set_runtime_middle_prompt_map(self, mapping):
-        self.runtime_middle_prompt_by_video_id = {
-            int(k): int(v) for k, v in (mapping or {}).items()
-        }
-        self.enable_middle_prompt = len(self.runtime_middle_prompt_by_video_id) > 0
+    def set_middle_prompt_enabled(self, enabled: bool):
+        self.enable_middle_prompt = bool(enabled)
 
-    def clear_runtime_middle_prompt_map(self):
-        self.runtime_middle_prompt_by_video_id = {}
+    def clear_middle_prompt(self):
         self.enable_middle_prompt = False
 
     @staticmethod
-    def _choose_fallback_middle(pos_t: torch.Tensor, lower: int, upper: int) -> int:
-        middle_candidates = [int(z) for z in pos_t.tolist() if lower < int(z) < upper]
-        if len(middle_candidates) == 0:
-            return lower
-        middle_candidates = sorted(middle_candidates)
-        return int(middle_candidates[len(middle_candidates) // 2])
-
-    @staticmethod
-    def _valid_mid_for_object(gt_obj_t_hw: torch.Tensor, mid: int, lower: int, upper: int) -> int:
-        t_dim = gt_obj_t_hw.shape[0]
-        mid = max(0, min(int(mid), t_dim - 1))
-        if bool(gt_obj_t_hw[mid].any()):
-            return mid
-        if bool(gt_obj_t_hw[lower].any()):
-            return int(lower)
-        if bool(gt_obj_t_hw[upper].any()):
-            return int(upper)
-        return int(mid)
+    def _midpoint(lower: int, upper: int) -> int:
+        return int((int(lower) + int(upper)) // 2)
 
     def prepare_prompt_inputs(self, backbone_out, input, start_frame_idx=0):
         gt_masks_per_frame = {
@@ -225,8 +201,6 @@ class SAM2TrainUpperLowerDynamicMiddleMask(SAM2Train):
         if t_dim != num_frames:
             raise ValueError(f"num_frames mismatch: {num_frames} vs {t_dim}")
 
-        obj_video_ids = input.metadata.unique_objects_identifier[0, :, 0].to(torch.long)
-
         lower_ids = []
         upper_ids = []
         middle_ids = []
@@ -242,20 +216,7 @@ class SAM2TrainUpperLowerDynamicMiddleMask(SAM2Train):
             else:
                 lower = int(pos_t.min().item())
                 upper = int(pos_t.max().item())
-
-                if self.enable_middle_prompt:
-                    video_id = int(obj_video_ids[obj_idx].item())
-                    external_mid = self.runtime_middle_prompt_by_video_id.get(video_id)
-                    if external_mid is None:
-                        external_mid = self._choose_fallback_middle(pos_t, lower, upper)
-                    middle = self._valid_mid_for_object(
-                        gt_obj_t_hw=masks_tohw[:, obj_idx],
-                        mid=int(external_mid),
-                        lower=lower,
-                        upper=upper,
-                    )
-                else:
-                    middle = None
+                middle = self._midpoint(lower=lower, upper=upper) if self.enable_middle_prompt else None
 
             lower_ids.append(lower)
             upper_ids.append(upper)
@@ -281,7 +242,7 @@ class SAM2TrainUpperLowerDynamicMiddleMask(SAM2Train):
             prompt_t = torch.zeros_like(gt_t)
             for o in range(o_dim):
                 if lower_ids[o] == t or upper_ids[o] == t or (
-                        self.enable_middle_prompt and middle_ids[o] is not None and middle_ids[o] == t
+                    self.enable_middle_prompt and middle_ids[o] is not None and middle_ids[o] == t
                 ):
                     prompt_t[o] = gt_t[o]
             backbone_out["mask_inputs_per_frame"][t] = prompt_t
@@ -415,7 +376,7 @@ def build_model(
     memory_attention = instantiate(memory_attention_cfg, _recursive_=True)
     memory_encoder = instantiate(memory_encoder_cfg, _recursive_=True)
 
-    model = SAM2TrainUpperLowerDynamicMiddleMask(
+    model = SAM2TrainUpperLowerMidpointMask(
         image_encoder=image_encoder,
         memory_attention=memory_attention,
         memory_encoder=memory_encoder,
@@ -454,25 +415,30 @@ def build_optimizer(model, base_lr: float, vision_lr: float, weight_decay: float
     return torch.optim.AdamW(groups)
 
 
-def _dice_loss_from_logits(logits: torch.Tensor, target: torch.Tensor, eps: float = 1e-6):
-    probs = torch.sigmoid(logits)
-    inter = (probs * target).sum(dim=(1, 2))
-    denom = probs.sum(dim=(1, 2)) + target.sum(dim=(1, 2))
-    dice = (2.0 * inter + eps) / (denom + eps)
-    return 1.0 - dice.mean()
+class DiceBCELoss(nn.Module):
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, logits, targets):
+        targets = targets.float()
+        bce = F.binary_cross_entropy_with_logits(logits, targets)
+
+        probs = torch.sigmoid(logits)
+        probs = probs.view(-1)
+        targets = targets.view(-1)
+
+        intersection = (probs * targets).sum()
+        dice = (2.0 * intersection + 1e-5) / (probs.sum() + targets.sum() + 1e-5)
+        dice_loss = 1 - dice
+        return 0.5 * bce + 0.5 * dice_loss
 
 
-def compute_dice_ce_loss(outputs, batch_masks: torch.Tensor):
-    # Final loss is normalized to keep strict < 1.
-    t_dim = batch_masks.shape[0]
+def compute_dice_bce_loss(outputs, batch_masks: torch.Tensor, criterion: DiceBCELoss):
     losses = []
-    for t in range(t_dim):
-        logits = outputs[t]["pred_masks_high_res"][:, 0]  # [O,H,W]
+    for t in range(batch_masks.shape[0]):
+        logits = outputs[t]["pred_masks_high_res"][:, 0]
         target = batch_masks[t].float()
-        ce_raw = F.binary_cross_entropy_with_logits(logits, target, reduction="mean")
-        ce_loss = ce_raw / (1.0 + ce_raw)  # in (0,1)
-        dice_loss = _dice_loss_from_logits(logits, target)
-        losses.append(0.5 * (dice_loss + ce_loss))
+        losses.append(criterion(logits, target))
     if len(losses) == 0:
         return torch.zeros((), device=batch_masks.device, dtype=torch.float32)
     return torch.stack(losses, dim=0).mean()
@@ -512,29 +478,6 @@ def _safe_hd95_2d(pred2d: np.ndarray, gt2d: np.ndarray) -> float:
     except Exception:
         return -1.0
 
-
-def select_rule_middle_from_gt(batch_masks: torch.Tensor, unique_objects_identifier):
-    t_dim, o_dim = batch_masks.shape[:2]
-    runtime_map = {}
-    gt_vols = batch_masks.detach().cpu().numpy().astype(np.uint8)
-
-    for o in range(o_dim):
-        video_id = int(unique_objects_identifier[0, o, 0].item())
-        gt_o = gt_vols[:, o]
-        pos = np.where(gt_o.reshape(t_dim, -1).any(axis=1))[0]
-        if len(pos) == 0:
-            runtime_map[video_id] = 0
-            continue
-
-        lower = int(pos.min())
-        upper = int(pos.max())
-        middle_candidates = [int(z) for z in pos.tolist() if lower < int(z) < upper]
-        if len(middle_candidates) == 0:
-            runtime_map[video_id] = lower
-            continue
-        middle_candidates = sorted(middle_candidates)
-        runtime_map[video_id] = int(middle_candidates[len(middle_candidates) // 2])
-    return runtime_map
 
 def ddp_enabled() -> bool:
     return dist.is_available() and dist.is_initialized()
@@ -580,7 +523,6 @@ def _forward_tracking_iterative(
     batch,
     output_dict=None,
     processing_order=None,
-    track_reverse_map=None,
 ):
     img_feats_already_computed = backbone_out["backbone_fpn"] is not None
     if img_feats_already_computed:
@@ -602,8 +544,6 @@ def _forward_tracking_iterative(
         }
     if processing_order is None:
         processing_order = init_cond_frames + backbone_out["frames_not_in_init_cond"]
-    if track_reverse_map is None:
-        track_reverse_map = {}
 
     for stage_id in processing_order:
         img_ids = batch.flat_obj_to_img_idx[stage_id]
@@ -632,7 +572,6 @@ def _forward_tracking_iterative(
             frames_to_add_correction_pt=frames_to_add_correction_pt,
             output_dict=output_dict,
             num_frames=num_frames,
-            track_in_reverse=bool(track_reverse_map.get(int(stage_id), False)),
         )
         add_output_as_cond_frame = stage_id in init_cond_frames or (
             core_model.add_all_frames_to_correct_as_cond
@@ -648,56 +587,97 @@ def _forward_tracking_iterative(
     return output_dict
 
 
-def _append_middle_prompts_inplace(core_model, base_backbone_out, backbone_stage1, batch):
-    # Build stage-2 prompt layout, then append only the new middle prompts to stage-1 backbone_out.
-    stage2_backbone = core_model.prepare_prompt_inputs(
-        _clone_backbone_out(base_backbone_out), batch
-    )
-    old_init = set(backbone_stage1["init_cond_frames"])
-    new_init = set(stage2_backbone["init_cond_frames"])
-    middle_frames = sorted(new_init - old_init)
-
-    for t in middle_frames:
-        if t in stage2_backbone["mask_inputs_per_frame"]:
-            backbone_stage1["mask_inputs_per_frame"][t] = stage2_backbone["mask_inputs_per_frame"][t]
-
-    merged_init = sorted(old_init | set(middle_frames))
-    backbone_stage1["init_cond_frames"] = merged_init
-    num_frames = int(backbone_stage1["num_frames"])
-    backbone_stage1["frames_not_in_init_cond"] = [t for t in range(num_frames) if t not in set(merged_init)]
-    return backbone_stage1, middle_frames
+def _build_empty_point_prompt(num_obj: int, device: torch.device):
+    return {
+        "point_coords": torch.zeros((num_obj, 0, 2), dtype=torch.float32, device=device),
+        "point_labels": torch.zeros((num_obj, 0), dtype=torch.int32, device=device),
+    }
 
 
-def _build_bidirectional_stage2_order_and_direction(frames_not_in_init_cond, middle_frames):
-    """
-    Stage-2 processing order:
-    1) run middle prompt frames first;
-    2) then run remaining frames by distance to the nearest middle frame (near-to-far).
-    This creates a middle-out bidirectional propagation order instead of plain sequence order.
-    """
-    middle_frames = sorted(set(int(t) for t in middle_frames))
-    middle_set = set(middle_frames)
-    remain = [int(t) for t in frames_not_in_init_cond if int(t) not in middle_set]
-    if len(middle_frames) == 0:
-        return remain, {}
+def _collect_detached_prev_logits(outputs):
+    prev_map = {}
+    for t, out_t in enumerate(outputs):
+        prev_logits = out_t["pred_masks"]
+        prev_map[t] = torch.clamp(prev_logits.detach(), -32.0, 32.0)
+    return prev_map
 
-    def _nearest_middle(frame_idx: int):
-        return min(middle_frames, key=lambda m: (abs(frame_idx - m), m))
 
-    def _dist_to_middle(frame_idx: int):
-        nm = _nearest_middle(frame_idx)
-        return abs(frame_idx - nm)
+def _forward_tracking_with_detached_prev_masks(
+    core_model,
+    backbone_out,
+    batch,
+    prev_mask_logits_per_frame,
+):
+    img_feats_already_computed = backbone_out["backbone_fpn"] is not None
+    if img_feats_already_computed:
+        (
+            _,
+            vision_feats,
+            vision_pos_embeds,
+            feat_sizes,
+        ) = core_model._prepare_backbone_features(backbone_out)
 
-    remain = sorted(remain, key=lambda t: (_dist_to_middle(t), t))
-    processing_order = middle_frames + remain
+    num_frames = backbone_out["num_frames"]
+    init_cond_frames = backbone_out["init_cond_frames"]
+    frames_to_add_correction_pt = backbone_out["frames_to_add_correction_pt"]
+    processing_order = init_cond_frames + backbone_out["frames_not_in_init_cond"]
+    output_dict = {
+        "cond_frame_outputs": {},
+        "non_cond_frame_outputs": {},
+    }
 
-    # True bidirectional tracking in stage-2:
-    # frames below middle use reverse tracking; above middle use forward tracking.
-    track_reverse_map = {}
-    for t in processing_order:
-        nm = _nearest_middle(int(t))
-        track_reverse_map[int(t)] = int(t) < int(nm)
-    return processing_order, track_reverse_map
+    for stage_id in processing_order:
+        img_ids = batch.flat_obj_to_img_idx[stage_id]
+        if img_feats_already_computed:
+            current_vision_feats = [x[:, img_ids] for x in vision_feats]
+            current_vision_pos_embeds = [x[:, img_ids] for x in vision_pos_embeds]
+        else:
+            (
+                _,
+                current_vision_feats,
+                current_vision_pos_embeds,
+                feat_sizes,
+            ) = core_model._prepare_backbone_features_per_frame(
+                batch.flat_img_batch, img_ids
+            )
+
+        mask_inputs = backbone_out["mask_inputs_per_frame"].get(stage_id, None)
+        point_inputs = backbone_out["point_inputs_per_frame"].get(stage_id, None)
+        prev_logits = None
+        if mask_inputs is None:
+            prev_logits = prev_mask_logits_per_frame.get(stage_id, None)
+            if prev_logits is not None and point_inputs is None:
+                point_inputs = _build_empty_point_prompt(
+                    num_obj=prev_logits.shape[0],
+                    device=prev_logits.device,
+                )
+
+        current_out = core_model.track_step(
+            frame_idx=stage_id,
+            is_init_cond_frame=stage_id in init_cond_frames,
+            current_vision_feats=current_vision_feats,
+            current_vision_pos_embeds=current_vision_pos_embeds,
+            feat_sizes=feat_sizes,
+            point_inputs=point_inputs,
+            mask_inputs=mask_inputs,
+            gt_masks=backbone_out["gt_masks_per_frame"].get(stage_id, None),
+            frames_to_add_correction_pt=frames_to_add_correction_pt,
+            output_dict=output_dict,
+            num_frames=num_frames,
+            prev_sam_mask_logits=prev_logits,
+        )
+        add_output_as_cond_frame = stage_id in init_cond_frames or (
+            core_model.add_all_frames_to_correct_as_cond
+            and stage_id in frames_to_add_correction_pt
+        )
+        if add_output_as_cond_frame:
+            output_dict["cond_frame_outputs"][stage_id] = current_out
+            output_dict["non_cond_frame_outputs"].pop(stage_id, None)
+        else:
+            output_dict["non_cond_frame_outputs"][stage_id] = current_out
+            output_dict["cond_frame_outputs"].pop(stage_id, None)
+
+    return output_dict
 
 
 def is_main_process() -> bool:
@@ -783,10 +763,29 @@ def resolve_best_ckpt_from_train_output(train_output_root: Path) -> Path:
     raise FileNotFoundError(f"Cannot resolve best checkpoint from TrainResults: {train_output_root}")
 
 
+def resolve_init_ckpt(args) -> Path:
+    if getattr(args, "init_ckpt", None) is not None:
+        p = Path(args.init_ckpt)
+        if not p.exists():
+            raise FileNotFoundError(f"init checkpoint not found: {p}")
+        return p
+
+    if getattr(args, "init_train_output_root", None) is not None:
+        train_output_root = Path(args.init_train_output_root)
+        if not train_output_root.exists():
+            raise FileNotFoundError(f"init TrainResults root not found: {train_output_root}")
+        return resolve_best_ckpt_from_train_output(train_output_root)
+
+    raise ValueError(
+        "Please provide either --init-ckpt (SAM2 original checkpoint) "
+        "or --init-train-output-root (previous TrainResult root)."
+    )
+
+
 def run_epoch_two_pass(
     model,
     loader,
-    loss_fn,
+    criterion,
     optimizer,
     scaler,
     device,
@@ -818,64 +817,47 @@ def run_epoch_two_pass(
         # -------------------------
         # Pass-1: boundary only
         # -------------------------
-        core_model.clear_runtime_middle_prompt_map()
+        core_model.clear_middle_prompt()
         backbone_stage1 = core_model.prepare_prompt_inputs(
             _clone_backbone_out(base_backbone_out), batch
         )
-
-        stage1_needs_grad = stage1_loss_weight > 0.0
-        grad_ctx = nullcontext() if stage1_needs_grad else torch.no_grad()
-        with grad_ctx:
-            with torch.cuda.amp.autocast(
-                enabled=(device.type == "cuda"),
-                dtype=amp_dtype,
-            ):
-                output_dict_stage1 = _forward_tracking_iterative(
-                    core_model, backbone_stage1, batch
-                )
-                outputs_stage1 = _outputs_from_tracking_dict(
-                    output_dict_stage1, backbone_stage1["num_frames"]
-                )
-                if stage1_needs_grad:
-                    loss_stage1 = loss_fn(outputs_stage1, batch.masks)
-                else:
-                    loss_stage1 = torch.zeros((), device=device, dtype=torch.float32)
-
-        runtime_middle_map = select_rule_middle_from_gt(
-            batch_masks=batch.masks,
-            unique_objects_identifier=batch.metadata.unique_objects_identifier,
-        )
-
-        # -------------------------
-        # Pass-2 (iterative only): continue on stage-1 memory and inject middle prompt
-        # -------------------------
-        core_model.set_runtime_middle_prompt_map(runtime_middle_map)
 
         with torch.cuda.amp.autocast(
             enabled=(device.type == "cuda"),
             dtype=amp_dtype,
         ):
-            backbone_stage2, middle_frames = _append_middle_prompts_inplace(
-                core_model, base_backbone_out, backbone_stage1, batch
+            output_dict_stage1 = _forward_tracking_iterative(
+                core_model, backbone_stage1, batch
             )
-            processing_order, track_reverse_map = _build_bidirectional_stage2_order_and_direction(
-                frames_not_in_init_cond=backbone_stage2["frames_not_in_init_cond"],
-                middle_frames=middle_frames,
+            outputs_stage1 = _outputs_from_tracking_dict(
+                output_dict_stage1, backbone_stage1["num_frames"]
             )
-            output_dict_stage2 = _forward_tracking_iterative(
+            loss_stage1 = compute_dice_bce_loss(outputs_stage1, batch.masks, criterion)
+        prev_mask_logits_per_frame = _collect_detached_prev_logits(outputs_stage1)
+
+        # -------------------------
+        # Pass-2: no stage-1 memory inheritance; use midpoint prompt + detached P0
+        # -------------------------
+        core_model.set_middle_prompt_enabled(True)
+
+        with torch.cuda.amp.autocast(
+            enabled=(device.type == "cuda"),
+            dtype=amp_dtype,
+        ):
+            backbone_stage2 = core_model.prepare_prompt_inputs(
+                _clone_backbone_out(base_backbone_out), batch
+            )
+            output_dict_stage2 = _forward_tracking_with_detached_prev_masks(
                 core_model,
                 backbone_stage2,
                 batch,
-                output_dict=output_dict_stage1,
-                processing_order=processing_order,
-                track_reverse_map=track_reverse_map,
+                prev_mask_logits_per_frame=prev_mask_logits_per_frame,
             )
             outputs_stage2 = _outputs_from_tracking_dict(
                 output_dict_stage2, backbone_stage2["num_frames"]
             )
-            loss_stage2 = loss_fn(outputs_stage2, batch.masks)
-            loss_raw = stage1_loss_weight * loss_stage1 + stage2_loss_weight * loss_stage2
-            loss = loss_raw / (1.0 + loss_raw)
+            loss_stage2 = compute_dice_bce_loss(outputs_stage2, batch.masks, criterion)
+            loss = stage1_loss_weight * loss_stage1 + stage2_loss_weight * loss_stage2
 
         if train_mode:
             scaler.scale(loss).backward()
@@ -886,13 +868,11 @@ def run_epoch_two_pass(
         total_dice += compute_batch_volume_dice(outputs_stage2, batch.masks)
         n_batch += 1
 
-        core_model.clear_runtime_middle_prompt_map()
+        core_model.clear_middle_prompt()
         # Release large per-batch references as early as possible.
         del outputs_stage2, output_dict_stage2, backbone_stage2
-        del backbone_stage1, output_dict_stage1, base_backbone_out
-        if "loss_raw" in locals():
-            del loss_raw
-        del runtime_middle_map, loss_stage2, loss_stage1, loss
+        del outputs_stage1, output_dict_stage1, backbone_stage1, base_backbone_out
+        del prev_mask_logits_per_frame, loss_stage2, loss_stage1, loss
         if (
             empty_cache_every > 0
             and device.type == "cuda"
@@ -938,7 +918,7 @@ def make_folds(patient_dirs, num_folds: int, seed: int):
 
 
 def main():
-    parser = argparse.ArgumentParser("SAM2 upper/lower -> rule middle iterative mask finetuning")
+    parser = argparse.ArgumentParser("SAM2 two-pass training with midpoint prompt + detached previous mask")
     parser.add_argument("--train-root", type=Path, required=True, help="Directory containing train patient folders")
     parser.add_argument("--output-root", type=Path, required=True, help="Output root for folds/checkpoints/logs")
     parser.add_argument(
@@ -948,10 +928,16 @@ def main():
         help="SAM2 model config in Hydra (e.g. configs/sam2.1/sam2.1_hiera_l.yaml)",
     )
     parser.add_argument(
+        "--init-ckpt",
+        type=Path,
+        default=DEFAULT_INIT_CKPT,
+        help="Initialization checkpoint path (default: SAM2 original pretrained .pt/.pth).",
+    )
+    parser.add_argument(
         "--init-train-output-root",
         type=Path,
-        required=True,
-        help="External TrainResults root; script auto-resolves best fold checkpoint for shared stage-1/stage-2 initialization.",
+        default=None,
+        help="Optional fallback: previous TrainResults root; auto-resolves best fold checkpoint.",
     )
     parser.add_argument("--image-name", type=str, default="image.nii.gz")
     parser.add_argument("--mask-name", type=str, default="CTV.nii.gz")
@@ -966,11 +952,12 @@ def main():
     parser.add_argument("--base-lr", type=float, default=1e-5)
     parser.add_argument("--vision-lr", type=float, default=1e-6)
     parser.add_argument("--weight-decay", type=float, default=0.05)
-    parser.add_argument("--eta-min-factor", type=float, default=0.1)
     parser.add_argument("--freeze-image-encoder", action="store_true", default=True)
     parser.add_argument("--no-freeze-image-encoder", dest="freeze_image_encoder", action="store_false")
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--amp-dtype", type=str, default="bfloat16", choices=["bfloat16", "float16"])
+    parser.add_argument("--stage1-loss-weight", type=float, default=0.5)
+    parser.add_argument("--stage2-loss-weight", type=float, default=0.5)
     parser.add_argument(
         "--forward-backbone-per-frame",
         action="store_true",
@@ -982,8 +969,6 @@ def main():
         default=0,
         help="Call torch.cuda.empty_cache every N batches (0 disables). Useful for fragmentation OOM.",
     )
-    parser.add_argument("--stage1-loss-weight", type=float, default=0.0)
-    parser.add_argument("--stage2-loss-weight", type=float, default=1.0)
     parser.add_argument(
         "--resume",
         action="store_true",
@@ -1017,12 +1002,12 @@ def main():
 
     if not args.train_root.exists():
         raise FileNotFoundError(f"train root not found: {args.train_root}")
-    if not args.init_train_output_root.exists():
-        raise FileNotFoundError(f"init TrainResults root not found: {args.init_train_output_root}")
-
-    init_ckpt = resolve_best_ckpt_from_train_output(args.init_train_output_root)
+    init_ckpt = resolve_init_ckpt(args)
     if is_main_process():
-        print(f"[INFO] init checkpoint resolved from {args.init_train_output_root}: {init_ckpt}")
+        if args.init_ckpt is not None:
+            print(f"[INFO] init checkpoint from --init-ckpt: {init_ckpt}")
+        else:
+            print(f"[INFO] init checkpoint resolved from {args.init_train_output_root}: {init_ckpt}")
 
     set_seed(args.seed)
     if use_ddp:
@@ -1123,11 +1108,13 @@ def main():
             optimizer,
             mode="max",
             factor=0.5,
-            patience=5,
-            min_lr=args.base_lr * args.eta_min_factor,
+            patience=2,
+            threshold=1e-3,
+            cooldown=1,
+            min_lr=1e-6,
         )
         scaler = torch.amp.GradScaler(device.type, enabled=(device.type == "cuda"))
-        loss_fn = compute_dice_ce_loss
+        criterion = DiceBCELoss().to(device)
 
         best_val_dice = -1.0
         best_epoch = -1
@@ -1177,7 +1164,7 @@ def main():
             tr_loss, tr_dice = run_epoch_two_pass(
                 model=model,
                 loader=train_loader,
-                loss_fn=loss_fn,
+                criterion=criterion,
                 optimizer=optimizer,
                 scaler=scaler,
                 device=device,
@@ -1193,7 +1180,7 @@ def main():
                 va_loss, va_dice = run_epoch_two_pass(
                     model=model,
                     loader=val_loader,
-                    loss_fn=loss_fn,
+                    criterion=criterion,
                     optimizer=optimizer,
                     scaler=scaler,
                     device=device,

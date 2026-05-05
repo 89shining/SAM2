@@ -45,7 +45,7 @@ from sam2.build_sam import build_sam2_video_predictor
 # ======================================================
 
 DATA_ROOT = Path("/home/wusi/SAM2/SAM2data/Eso/20260108/Data83")
-OUT_ROOT = Path("/home/wusi/SAM2/SAM2data/Eso/20260326/zero-shot/rule_mask")
+OUT_ROOT = Path("/home/wusi/SAM2/SAM2data/Eso/20260326/zero-shot/Try_rule_mask")
 
 MID_MASK_DIR = OUT_ROOT / "rule_middle_mask"
 MAXAREA_MASK_DIR = OUT_ROOT / "rule_maxarea_mask"

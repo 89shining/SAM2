@@ -78,7 +78,7 @@ def gt_positive_slices(gt_zyx: np.ndarray):
 
 
 def choose_middle_rule(middle_candidates):
-    # Same as Inference/rule_mask/mask_prompt_rule.py
+    # Same as Inference/Try_rule_mask/mask_prompt_rule.py
     if len(middle_candidates) == 0:
         return None
     cands = sorted(int(x) for x in middle_candidates)
@@ -91,21 +91,49 @@ def relative_pos_upper_to_lower(slice_id: int, lower_id: int, upper_id: int):
     return float((upper_id - slice_id) / (upper_id - lower_id))
 
 
+def _build_bidirectional_stage2_order_and_direction(frames_not_in_init_cond, middle_frames):
+    """
+    Match v2 training stage-2 order:
+    1) middle prompt frames first;
+    2) remaining frames sorted by distance to nearest middle (near-to-far).
+    Also build per-frame reverse direction map.
+    """
+    middle_frames = sorted(set(int(t) for t in middle_frames))
+    middle_set = set(middle_frames)
+    remain = [int(t) for t in frames_not_in_init_cond if int(t) not in middle_set]
+    if len(middle_frames) == 0:
+        return remain, {}
+
+    def _nearest_middle(frame_idx: int):
+        return min(middle_frames, key=lambda m: (abs(frame_idx - m), m))
+
+    remain = sorted(remain, key=lambda t: (abs(t - _nearest_middle(t)), t))
+    processing_order = middle_frames + remain
+
+    track_reverse_map = {}
+    for t in processing_order:
+        nm = _nearest_middle(int(t))
+        track_reverse_map[int(t)] = int(t) < int(nm)
+    return processing_order, track_reverse_map
+
+
 @torch.no_grad()
-def propagate_in_custom_order(
+def _propagate_in_custom_order_with_reverse_map(
     predictor,
     state,
     processing_order,
+    track_reverse_map,
     obj_id: int,
     pred_init: np.ndarray,
 ):
-    # Mirror predictor.propagate_in_video internals, but use explicit processing_order.
+    # Mirror predictor.propagate_in_video internals, but use explicit order + per-frame reverse.
     predictor.propagate_in_video_preflight(state)
     obj_ids = state["obj_ids"]
     batch_size = predictor._get_obj_num(state)
     pred = pred_init.copy()
 
     for frame_idx in processing_order:
+        reverse = bool(track_reverse_map.get(int(frame_idx), False))
         pred_masks_per_obj = [None] * batch_size
         for obj_idx in range(batch_size):
             obj_output_dict = state["output_dict_per_obj"][obj_idx]
@@ -128,12 +156,12 @@ def propagate_in_custom_order(
                     is_init_cond_frame=False,
                     point_inputs=None,
                     mask_inputs=None,
-                    reverse=False,
+                    reverse=reverse,
                     run_mem_encoder=True,
                 )
                 obj_output_dict[storage_key][frame_idx] = current_out
 
-            state["frames_tracked_per_obj"][obj_idx][frame_idx] = {"reverse": False}
+            state["frames_tracked_per_obj"][obj_idx][frame_idx] = {"reverse": reverse}
             pred_masks_per_obj[obj_idx] = pred_masks
 
         if len(pred_masks_per_obj) > 1:
@@ -188,7 +216,6 @@ def infer_two_stage_iterative_with_rule_middle(
                 break
 
     # Stage-2: inherit stage-1 memory and inject middle prompt
-    stage1_init_cond = set(stage1_prompt_ids)
     if int(middle_id) not in stage1_prompt_ids:
         mid_mask = (gt_zyx[int(middle_id)] > 0).astype(np.uint8)
         if mid_mask.sum() == 0:
@@ -200,19 +227,22 @@ def infer_two_stage_iterative_with_rule_middle(
             mask=mid_mask,
         )
 
+    stage1_init_cond = set(stage1_prompt_ids)
     stage2_init_cond = set(stage1_prompt_ids)
     if int(middle_id) not in stage1_init_cond:
         stage2_init_cond.add(int(middle_id))
     middle_frames = sorted(stage2_init_cond - stage1_init_cond)
     frames_not_in_init_cond = [t for t in range(z) if t not in stage2_init_cond]
-    processing_order = middle_frames + [
-        t for t in frames_not_in_init_cond if t not in set(middle_frames)
-    ]
+    processing_order, track_reverse_map = _build_bidirectional_stage2_order_and_direction(
+        frames_not_in_init_cond=frames_not_in_init_cond,
+        middle_frames=middle_frames,
+    )
 
-    pred_stage2 = propagate_in_custom_order(
+    pred_stage2 = _propagate_in_custom_order_with_reverse_map(
         predictor=predictor,
         state=state,
         processing_order=processing_order,
+        track_reverse_map=track_reverse_map,
         obj_id=obj_id,
         pred_init=pred_stage1,
     )

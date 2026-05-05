@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 SAM2 finetuning with 3 mask prompts (upper/lower + rule-middle).
-Rule-middle follows Inference/rule_mask/mask_prompt_rule.py middle rule.
+Rule-middle follows Inference/Try_rule_mask/mask_prompt_rule.py middle rule.
 
 Example:
 CUDA_VISIBLE_DEVICES=0,1 torchrun --nproc_per_node=2 train_upper_lower_middle_rule_cv.py
@@ -45,7 +45,7 @@ from training.utils.data_utils import Frame, Object, VideoDatapoint, collate_fn
 
 # ================= Default Paths (edit here) =================
 DEFAULT_TRAIN_ROOT = Path("/home/wusi/SAM2/SAM2data/Eso/20260326/datanii/train_nii")
-DEFAULT_OUTPUT_ROOT = Path("/home/wusi/SAM2/SAM2data/Eso/20260326/Train/rule_mask/mask_prompt_3/one_epoch/TrainResult")
+DEFAULT_OUTPUT_ROOT = Path("/home/wusi/SAM2/SAM2data/Eso/20260326/Train/Try_rule_mask/mask_prompt_3/one_epoch/TrainResult")
 DEFAULT_MODEL_CFG = "configs/sam2.1/sam2.1_hiera_l.yaml"
 DEFAULT_PRETRAINED_CKPT = Path("/home/wusi/SAM2/checkpoints/sam2.1_hiera_large.pt")
 

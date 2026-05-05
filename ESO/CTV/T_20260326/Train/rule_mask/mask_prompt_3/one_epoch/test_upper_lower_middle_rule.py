@@ -28,10 +28,10 @@ from sam2.build_sam import build_sam2_video_predictor
 
 # ================= Default Paths (edit here) =================
 DEFAULT_TEST_ROOT = Path("/home/wusi/SAM2/SAM2data/Eso/20260326/datanii/test_nii")
-DEFAULT_OUTPUT_ROOT = Path("/home/wusi/SAM2/SAM2data/Eso/20260326/Train/rule_mask/mask_prompt_3/one_epoch/TestResult")
+DEFAULT_OUTPUT_ROOT = Path("/home/wusi/SAM2/SAM2data/Eso/20260326/Train/Try_rule_mask/mask_prompt_3/one_epoch/TestResult")
 DEFAULT_MODEL_CFG = "configs/sam2.1/sam2.1_hiera_l.yaml"
-DEFAULT_FINETUNED_CKPT = Path("/home/wusi/SAM2/SAM2data/Eso/20260326/Train/rule_mask/mask_prompt_3/one_epoch/TrainResult/fold_0/checkpoints/best.pth")
-DEFAULT_TRAIN_OUTPUT_ROOT = Path("/home/wusi/SAM2/SAM2data/Eso/20260326/Train/rule_mask/mask_prompt_3/one_epoch/TrainResult")
+DEFAULT_FINETUNED_CKPT = Path("/home/wusi/SAM2/SAM2data/Eso/20260326/Train/Try_rule_mask/mask_prompt_3/one_epoch/TrainResult/fold_0/checkpoints/best.pth")
+DEFAULT_TRAIN_OUTPUT_ROOT = Path("/home/wusi/SAM2/SAM2data/Eso/20260326/Train/Try_rule_mask/mask_prompt_3/one_epoch/TrainResult")
 
 
 def window_to_uint8(img2d: np.ndarray, wc: float, ww: float) -> np.ndarray:
@@ -82,7 +82,7 @@ def gt_positive_slices(gt_zyx: np.ndarray):
 
 
 def choose_middle_rule(middle_candidates):
-    # Same as Inference/rule_mask/mask_prompt_rule.py
+    # Same as Inference/Try_rule_mask/mask_prompt_rule.py
     if len(middle_candidates) == 0:
         return None
     cands = sorted(int(x) for x in middle_candidates)

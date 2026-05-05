@@ -10,9 +10,9 @@ from pathlib import Path
 
 # ================= Centralized Paths =================
 DEFAULT_DATA_ROOT = Path("/home/wusi/SAM2/SAM2data/Eso/20260326/datanii")
-DEFAULT_EXP_ROOT = Path("/home/wusi/SAM2/SAM2data/Eso/20260423/Train/rule_mask/mask_prompt_3/two_epoch/v1")
+DEFAULT_EXP_ROOT = Path("/home/wusi/SAM2/SAM2data/Eso/20260423/Try_rule_mask/mask_prompt_3/two_epoch/v5")
 DEFAULT_MODEL_CFG = "configs/sam2.1/sam2.1_hiera_l.yaml"
-DEFAULT_INIT_TRAIN_OUTPUT_ROOT = Path("/home/wusi/SAM2/SAM2data/Eso/20260326/Train/oracle_mask/mask_prompt_2/TrainResult")
+DEFAULT_INIT_CKPT = Path("/home/wusi/SAM2/checkpoints/sam2.1_hiera_large.pt")
 
 
 def run_cmd(cmd, env=None, cwd=None):
@@ -31,9 +31,9 @@ def pick_free_port() -> int:
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Run rule-mask two-epoch iterative training then testing (auto-resume enabled)."
+        description="Run v5 bidirectional autoregressive training then testing (auto-resume enabled)."
     )
-    parser.add_argument("--gpu", type=str, default="4", help="CUDA_VISIBLE_DEVICES value")
+    parser.add_argument("--gpu", type=str, default="5", help="CUDA_VISIBLE_DEVICES value")
     parser.add_argument("--nproc-per-node", type=int, default=1, help="torchrun nproc per node")
     parser.add_argument(
         "--master-port",
@@ -50,13 +50,24 @@ def main():
     parser.add_argument("--test-subdir", type=str, default="test_nii", help="Test subdir under data-root")
     parser.add_argument("--exp-root", type=Path, default=DEFAULT_EXP_ROOT, help="Experiment root containing TrainResult/TestResult")
     parser.add_argument("--model-cfg", type=str, default=DEFAULT_MODEL_CFG, help="SAM2 model config")
-    parser.add_argument("--stage1-loss-weight", type=float, default=0.0, help="Stage-1 loss weight passed to train.py")
-    parser.add_argument("--stage2-loss-weight", type=float, default=1.0, help="Stage-2 loss weight passed to train.py")
+    parser.add_argument(
+        "--seed-prompt-mode",
+        type=str,
+        default="single",
+        choices=["single", "bounds"],
+        help="single: use first frame GT as seed per direction; bounds: use lower/upper GT seeds.",
+    )
+    parser.add_argument(
+        "--init-ckpt",
+        type=Path,
+        default=DEFAULT_INIT_CKPT,
+        help="Initialization checkpoint path (default: original SAM2 pretrained checkpoint).",
+    )
     parser.add_argument(
         "--init-train-output-root",
         type=Path,
-        default=DEFAULT_INIT_TRAIN_OUTPUT_ROOT,
-        help="External TrainResults root used to auto-resolve best fold checkpoint for initialization.",
+        default=None,
+        help="Optional fallback: previous TrainResults root used to auto-resolve best fold checkpoint.",
     )
     args = parser.parse_args()
 
@@ -68,7 +79,9 @@ def main():
         raise FileNotFoundError(f"Train script not found: {train_script}")
     if not test_script.exists():
         raise FileNotFoundError(f"Test script not found: {test_script}")
-    if not args.init_train_output_root.exists():
+    if args.init_ckpt is not None and not Path(args.init_ckpt).exists():
+        raise FileNotFoundError(f"init checkpoint not found: {args.init_ckpt}")
+    if args.init_train_output_root is not None and not Path(args.init_train_output_root).exists():
         raise FileNotFoundError(f"init TrainResults root not found: {args.init_train_output_root}")
 
     env = os.environ.copy()
@@ -92,14 +105,19 @@ def main():
         str(train_output_root),
         "--model-cfg",
         str(args.model_cfg),
-        "--init-train-output-root",
-        str(args.init_train_output_root),
-        "--stage1-loss-weight",
-        str(args.stage1_loss_weight),
-        "--stage2-loss-weight",
-        str(args.stage2_loss_weight),
+        "--seed-prompt-mode",
+        str(args.seed_prompt_mode),
+        "--init-ckpt",
+        str(args.init_ckpt),
         "--resume",
     ]
+    if args.init_train_output_root is not None:
+        train_cmd.extend(
+            [
+                "--init-train-output-root",
+                str(args.init_train_output_root),
+            ]
+        )
 
     test_cmd = [
         args.python,
@@ -112,6 +130,8 @@ def main():
         str(train_output_root),
         "--model-cfg",
         str(args.model_cfg),
+        "--seed-prompt-mode",
+        str(args.seed_prompt_mode),
     ]
 
     print(f"[INFO] Working dir: {script_dir}", flush=True)
@@ -120,13 +140,13 @@ def main():
     print(f"[INFO] test_root={test_root}", flush=True)
     print(f"[INFO] train_output_root={train_output_root}", flush=True)
     print(f"[INFO] test_output_root={test_output_root}", flush=True)
+    print(f"[INFO] seed_prompt_mode={args.seed_prompt_mode}", flush=True)
+    print(f"[INFO] init_ckpt={args.init_ckpt}", flush=True)
     print(f"[INFO] init_train_output_root={args.init_train_output_root}", flush=True)
-    print(f"[INFO] stage1_loss_weight={args.stage1_loss_weight}", flush=True)
-    print(f"[INFO] stage2_loss_weight={args.stage2_loss_weight}", flush=True)
     print(f"[INFO] master_port={master_port}", flush=True)
     print("[INFO] Resume policy: ON (always pass --resume)", flush=True)
 
-    print("[1/2] Training (iterative + auto-resume)", flush=True)
+    print("[1/2] Training (auto-resume)", flush=True)
     run_cmd(train_cmd, env=env, cwd=str(script_dir))
 
     print("[2/2] Testing", flush=True)

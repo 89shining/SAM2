@@ -78,7 +78,7 @@ def gt_positive_slices(gt_zyx: np.ndarray):
 
 
 def choose_middle_rule(middle_candidates):
-    # Same as Inference/rule_mask/mask_prompt_rule.py
+    # Same as Inference/Try_rule_mask/mask_prompt_rule.py
     if len(middle_candidates) == 0:
         return None
     cands = sorted(int(x) for x in middle_candidates)
@@ -89,93 +89,6 @@ def relative_pos_upper_to_lower(slice_id: int, lower_id: int, upper_id: int):
     if upper_id == lower_id:
         return 0.0
     return float((upper_id - slice_id) / (upper_id - lower_id))
-
-
-def _build_bidirectional_stage2_order_and_direction(frames_not_in_init_cond, middle_frames):
-    """
-    Match v2 training stage-2 order:
-    1) middle prompt frames first;
-    2) remaining frames sorted by distance to nearest middle (near-to-far).
-    Also build per-frame reverse direction map.
-    """
-    middle_frames = sorted(set(int(t) for t in middle_frames))
-    middle_set = set(middle_frames)
-    remain = [int(t) for t in frames_not_in_init_cond if int(t) not in middle_set]
-    if len(middle_frames) == 0:
-        return remain, {}
-
-    def _nearest_middle(frame_idx: int):
-        return min(middle_frames, key=lambda m: (abs(frame_idx - m), m))
-
-    remain = sorted(remain, key=lambda t: (abs(t - _nearest_middle(t)), t))
-    processing_order = middle_frames + remain
-
-    track_reverse_map = {}
-    for t in processing_order:
-        nm = _nearest_middle(int(t))
-        track_reverse_map[int(t)] = int(t) < int(nm)
-    return processing_order, track_reverse_map
-
-
-@torch.no_grad()
-def _propagate_in_custom_order_with_reverse_map(
-    predictor,
-    state,
-    processing_order,
-    track_reverse_map,
-    obj_id: int,
-    pred_init: np.ndarray,
-):
-    # Mirror predictor.propagate_in_video internals, but use explicit order + per-frame reverse.
-    predictor.propagate_in_video_preflight(state)
-    obj_ids = state["obj_ids"]
-    batch_size = predictor._get_obj_num(state)
-    pred = pred_init.copy()
-
-    for frame_idx in processing_order:
-        reverse = bool(track_reverse_map.get(int(frame_idx), False))
-        pred_masks_per_obj = [None] * batch_size
-        for obj_idx in range(batch_size):
-            obj_output_dict = state["output_dict_per_obj"][obj_idx]
-            if frame_idx in obj_output_dict["cond_frame_outputs"]:
-                storage_key = "cond_frame_outputs"
-                current_out = obj_output_dict[storage_key][frame_idx]
-                device = state["device"]
-                pred_masks = current_out["pred_masks"].to(device, non_blocking=True)
-                if predictor.clear_non_cond_mem_around_input:
-                    predictor._clear_obj_non_cond_mem_around_input(
-                        state, frame_idx, obj_idx
-                    )
-            else:
-                storage_key = "non_cond_frame_outputs"
-                current_out, pred_masks = predictor._run_single_frame_inference(
-                    inference_state=state,
-                    output_dict=obj_output_dict,
-                    frame_idx=frame_idx,
-                    batch_size=1,
-                    is_init_cond_frame=False,
-                    point_inputs=None,
-                    mask_inputs=None,
-                    reverse=reverse,
-                    run_mem_encoder=True,
-                )
-                obj_output_dict[storage_key][frame_idx] = current_out
-
-            state["frames_tracked_per_obj"][obj_idx][frame_idx] = {"reverse": reverse}
-            pred_masks_per_obj[obj_idx] = pred_masks
-
-        if len(pred_masks_per_obj) > 1:
-            all_pred_masks = torch.cat(pred_masks_per_obj, dim=0)
-        else:
-            all_pred_masks = pred_masks_per_obj[0]
-        _, video_res_masks = predictor._get_orig_video_res_output(state, all_pred_masks)
-
-        for i, oid in enumerate(obj_ids):
-            if int(oid) == obj_id:
-                pred[int(frame_idx)] = (video_res_masks[i] > 0).cpu().numpy()
-                break
-
-    return pred
 
 
 @torch.no_grad()
@@ -227,25 +140,62 @@ def infer_two_stage_iterative_with_rule_middle(
             mask=mid_mask,
         )
 
-    stage1_init_cond = set(stage1_prompt_ids)
-    stage2_init_cond = set(stage1_prompt_ids)
-    if int(middle_id) not in stage1_init_cond:
-        stage2_init_cond.add(int(middle_id))
-    middle_frames = sorted(stage2_init_cond - stage1_init_cond)
-    frames_not_in_init_cond = [t for t in range(z) if t not in stage2_init_cond]
-    processing_order, track_reverse_map = _build_bidirectional_stage2_order_and_direction(
-        frames_not_in_init_cond=frames_not_in_init_cond,
-        middle_frames=middle_frames,
+    pred_stage2 = np.zeros((z, h, w), dtype=np.uint8)
+    # Stage-2 two-pass middle-out propagation:
+    # pass-A from middle to higher slices, then pass-B from middle to lower slices.
+    stage2_forward_written = set()
+    for fidx, obj_ids, logits in predictor.propagate_in_video(
+        state,
+        start_frame_idx=int(middle_id),
+        max_frame_num_to_track=z,
+        reverse=False,
+    ):
+        print("[DEBUG stage2 forward] fidx:", fidx)
+        for i, oid in enumerate(obj_ids):
+            if int(oid) == obj_id:
+                pred_stage2[int(fidx)] = (logits[i] > 0).cpu().numpy()
+                stage2_forward_written.add(int(fidx))
+                break
+
+    print(
+        "[DEBUG stage2] forward updated frames:",
+        sorted(stage2_forward_written),
     )
 
-    pred_stage2 = _propagate_in_custom_order_with_reverse_map(
-        predictor=predictor,
-        state=state,
-        processing_order=processing_order,
-        track_reverse_map=track_reverse_map,
-        obj_id=obj_id,
-        pred_init=pred_stage1,
+    stage2_reverse_written = set()
+    for fidx, obj_ids, logits in predictor.propagate_in_video(
+        state,
+        start_frame_idx=int(middle_id),
+        max_frame_num_to_track=z,
+        reverse=True,
+    ):
+        print("[DEBUG stage2 reverse] fidx:", fidx)
+        for i, oid in enumerate(obj_ids):
+            if int(oid) == obj_id:
+                pred_stage2[int(fidx)] = (logits[i] > 0).cpu().numpy()
+                stage2_reverse_written.add(int(fidx))
+                break
+    print(
+        "[DEBUG stage2] reverse updated frames:",
+        sorted(stage2_reverse_written),
     )
+    print(
+        "[DEBUG stage2] union(updated frames):",
+        sorted(stage2_forward_written.union(stage2_reverse_written)),
+    )
+    print("[DEBUG] pred_stage1 sum:", pred_stage1.sum())
+    print("[DEBUG] pred_stage2 sum:", pred_stage2.sum())
+    print(
+        "[DEBUG] pred diff sum:",
+        np.abs(pred_stage2.astype(np.int32) - pred_stage1.astype(np.int32)).sum(),
+    )
+    for z in range(pred_stage1.shape[0]):
+        d = np.abs(pred_stage2[z].astype(np.int32) - pred_stage1[z].astype(np.int32)).sum()
+        if d > 0:
+            print(
+                f"[DEBUG] changed frame {z}: diff={d}, "
+                f"stage1_sum={pred_stage1[z].sum()}, stage2_sum={pred_stage2[z].sum()}"
+            )
     return pred_stage1, pred_stage2
 
 
@@ -368,8 +318,15 @@ def main():
                 middle_id=middle_id,
                 obj_id=args.obj_id,
             )
+            print("[DEBUG main] pred_stage1 sum:", pred_stage1.sum())
+            print("[DEBUG main] pred_stage2 sum:", pred_stage2.sum())
+            print(
+                "[DEBUG main] pred diff sum:",
+                np.abs(pred_stage2.astype(np.int32) - pred_stage1.astype(np.int32)).sum(),
+            )
             dice_stage1 = dice_3d(pred_stage1, gt_zyx)
             dice_stage2 = dice_3d(pred_stage2, gt_zyx)
+            print("[DEBUG save] saving pred_stage2, sum:", pred_stage2.sum())
             write_mask_like(pred_stage2, img_sitk, out_mask_path)
             print(
                 f"[OK] {patient_id}: stage1_dice={dice_stage1:.4f}, "
