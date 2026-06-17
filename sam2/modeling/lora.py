@@ -42,6 +42,7 @@ class LoRAConfig:
     alpha: int = 16
     dropout: float = 0.1
     target_modules: Tuple[str, ...] = ("q_proj", "v_proj")
+    target_prefixes: Tuple[str, ...] = ()
     freeze_base_model: bool = True
 
 
@@ -57,6 +58,13 @@ def _matches_target(module_name: str, target_modules: Iterable[str]) -> bool:
     return any(module_name == target or module_name.endswith(f".{target}") for target in target_modules)
 
 
+def _matches_prefix(module_name: str, target_prefixes: Iterable[str]) -> bool:
+    prefixes = tuple(target_prefixes)
+    if len(prefixes) == 0:
+        return True
+    return any(module_name == prefix or module_name.startswith(f"{prefix}.") for prefix in prefixes)
+
+
 def apply_lora(
     model: nn.Module,
     config: LoRAConfig = LoRAConfig(),
@@ -67,7 +75,11 @@ def apply_lora(
 
     replacements = []
     for module_name, module in model.named_modules():
-        if isinstance(module, nn.Linear) and _matches_target(module_name, config.target_modules):
+        if (
+            isinstance(module, nn.Linear)
+            and _matches_prefix(module_name, config.target_prefixes)
+            and _matches_target(module_name, config.target_modules)
+        ):
             replacements.append((module_name, module))
 
     for module_name, module in replacements:
