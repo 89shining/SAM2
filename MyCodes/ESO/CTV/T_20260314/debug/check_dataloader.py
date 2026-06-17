@@ -17,7 +17,7 @@
 # print("num frames in video:", len(video.frames))
 
 # batch
-from ESO.CTV.T_20260314.datasets.eso_ctv_train_data import EsoCTVTrainData
+from MyCodes.ESO.CTV.T_20260314.datasets.eso_ctv_train_data import EsoCTVTrainData
 
 def main():
     data = EsoCTVTrainData(

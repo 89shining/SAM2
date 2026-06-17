@@ -1,8 +1,7 @@
-import torch
 from torch.utils.data import DataLoader
 
-from ESO.CTV.T_20260314.utils.data_utils_ctv import collate_fn
-from ESO.CTV.T_20260314.datasets.eso_ctv_video_dataset import EsoCTVVideoDataset
+from MyCodes.ESO.CTV.T_20260314.utils.data_utils_ctv import collate_fn
+from MyCodes.ESO.CTV.T_20260314.datasets.eso_ctv_video_dataset import EsoCTVVideoDataset
 
 
 class EsoCTVTrainData:

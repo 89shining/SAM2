@@ -496,7 +496,7 @@ def unwrap_model(model):
     return model.module if isinstance(model, DDP) else model
 
 
-def save_ckpt(path: Path, epoch: int, model, optimizer, scheduler, scaler, best_val_dice: float):
+def save_ckpt(path: Path, epoch: int, model, optimizer, scheduler, scaler, best_val_dice: float, best_epoch: int):
     if not is_main_process():
         return
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -508,6 +508,7 @@ def save_ckpt(path: Path, epoch: int, model, optimizer, scheduler, scaler, best_
             "scheduler": scheduler.state_dict() if scheduler is not None else None,
             "scaler": scaler.state_dict() if scaler is not None else None,
             "best_val_dice": best_val_dice,
+            "best_epoch": best_epoch,
         },
         str(path),
     )
@@ -523,7 +524,11 @@ def load_ckpt(path: Path, model, optimizer=None, scheduler=None, scaler=None, ma
         scheduler.load_state_dict(state["scheduler"])
     if scaler is not None and isinstance(state, dict) and state.get("scaler") is not None:
         scaler.load_state_dict(state["scaler"])
-    return int(state.get("epoch", 0)), float(state.get("best_val_dice", -1.0))
+    return (
+        int(state.get("epoch", 0)),
+        float(state.get("best_val_dice", -1.0)),
+        int(state.get("best_epoch", -1)),
+    )
 
 def make_folds(patient_dirs, num_folds: int, seed: int):
     patient_dirs = list(patient_dirs)
@@ -668,7 +673,7 @@ def train_for_single_k(
         if args.resume and (resume_fold_set is None or fold_idx in resume_fold_set):
             resume_ckpt = ckpt_dir / "last.pth"
             if resume_ckpt.exists():
-                start_epoch, best_val_dice = load_ckpt(
+                start_epoch, best_val_dice, best_epoch = load_ckpt(
                     path=resume_ckpt,
                     model=model,
                     optimizer=optimizer,
@@ -676,13 +681,16 @@ def train_for_single_k(
                     scaler=scaler,
                     map_location="cpu",
                 )
-                best_epoch = start_epoch
                 hist_json = log_dir / "history.json"
                 if hist_json.exists():
                     try:
                         history = json.loads(hist_json.read_text(encoding="utf-8"))
                     except Exception:
                         history = []
+                if best_epoch < 0 and history:
+                    best_row = max(history, key=lambda x: float(x.get("val_dice", -1.0)))
+                    best_epoch = int(best_row.get("epoch", start_epoch))
+                    best_val_dice = float(best_row.get("val_dice", best_val_dice))
 
         for epoch in range(start_epoch, args.epochs):
             if train_sampler is not None:
@@ -710,11 +718,29 @@ def train_for_single_k(
                     f"val_loss={va_loss:.4f} val_dice={va_dice:.4f}"
                 )
 
-            save_ckpt(ckpt_dir / "last.pth", epoch + 1, model, optimizer, scheduler, scaler, best_val_dice)
             if va_dice > best_val_dice:
                 best_val_dice = va_dice
                 best_epoch = epoch + 1
-                save_ckpt(ckpt_dir / "best.pth", epoch + 1, model, optimizer, scheduler, scaler, best_val_dice)
+                save_ckpt(
+                    ckpt_dir / "best.pth",
+                    epoch + 1,
+                    model,
+                    optimizer,
+                    scheduler,
+                    scaler,
+                    best_val_dice,
+                    best_epoch,
+                )
+            save_ckpt(
+                ckpt_dir / "last.pth",
+                epoch + 1,
+                model,
+                optimizer,
+                scheduler,
+                scaler,
+                best_val_dice,
+                best_epoch,
+            )
 
         if is_main_process():
             with open(log_dir / "history.json", "w", encoding="utf-8") as f:

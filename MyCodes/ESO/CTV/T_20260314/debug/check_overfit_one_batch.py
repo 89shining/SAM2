@@ -2,7 +2,7 @@ import torch
 from hydra import compose, initialize_config_dir
 from hydra.utils import instantiate
 
-from ESO.CTV.T_20260314.datasets.eso_ctv_train_data import EsoCTVTrainData
+from MyCodes.ESO.CTV.T_20260314.datasets.eso_ctv_train_data import EsoCTVTrainData
 
 
 def main():
@@ -25,7 +25,7 @@ def main():
     batch = next(iter(loader))
 
     # 2. 配置
-    config_dir = r"D:\project\SAM2\ESO\CTV\T_20260314\configs"
+    config_dir = r"/MyCodes/ESO/CTV/T_20260314/configs"
     with initialize_config_dir(config_dir=config_dir, version_base="1.2"):
         cfg = compose(config_name="sam2_ctv_finetune")
 

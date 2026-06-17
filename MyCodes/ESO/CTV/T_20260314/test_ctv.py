@@ -4,7 +4,6 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(PROJECT_ROOT))
 
-import os
 import csv
 import re
 import torch
@@ -15,7 +14,7 @@ from tqdm import tqdm
 from hydra import initialize_config_dir, compose
 from hydra.utils import instantiate
 
-from ESO.CTV.T_20260314.utils.data_utils_ctv import (
+from MyCodes.ESO.CTV.T_20260314.utils.data_utils_ctv import (
     Frame, Object, VideoDatapoint, collate_fn
 )
 

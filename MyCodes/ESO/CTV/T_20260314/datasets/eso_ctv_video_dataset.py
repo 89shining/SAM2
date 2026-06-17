@@ -1,13 +1,12 @@
 # 生成clip和prompt
 
-import os
 from pathlib import Path
 
 import numpy as np
 import SimpleITK as sitk
 import torch
 
-from ESO.CTV.T_20260314.utils.data_utils_ctv import VideoDatapoint, Frame, Object
+from MyCodes.ESO.CTV.T_20260314.utils.data_utils_ctv import VideoDatapoint, Frame, Object
 
 
 class EsoCTVVideoDataset(torch.utils.data.Dataset):

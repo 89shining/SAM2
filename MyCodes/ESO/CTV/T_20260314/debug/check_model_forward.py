@@ -2,7 +2,7 @@ import torch
 from hydra import compose, initialize_config_dir
 from hydra.utils import instantiate
 
-from ESO.CTV.T_20260314.datasets.eso_ctv_train_data import EsoCTVTrainData
+from MyCodes.ESO.CTV.T_20260314.datasets.eso_ctv_train_data import EsoCTVTrainData
 
 
 def main():
@@ -22,8 +22,7 @@ def main():
         clip_len=8,
         stride=4,
     )
-    from torch.utils.data import DataLoader
-    from ESO.CTV.T_20260314.utils.data_utils_ctv import collate_fn
+    from MyCodes.ESO.CTV.T_20260314.utils.data_utils_ctv import collate_fn
 
     dataset = data.dataset
     batch = collate_fn([dataset[1]], dict_key="all")
@@ -34,7 +33,7 @@ def main():
     print("batch.metadata.prompt_frame_idx:", batch.metadata.prompt_frame_idx[:, 0])
 
     # ===== 2. 从你自己的 config 文件夹读取 yaml =====
-    config_dir = r"D:\project\SAM2\ESO\CTV\T_20260314\configs"
+    config_dir = r"/MyCodes/ESO/CTV/T_20260314/configs"
 
     with initialize_config_dir(config_dir=config_dir, version_base="1.2"):
         cfg = compose(config_name="sam2_ctv_finetune")
