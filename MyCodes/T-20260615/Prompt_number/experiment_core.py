@@ -36,7 +36,7 @@ def _ensure_project_root_on_path():
 
 _ensure_project_root_on_path()
 
-from sam2.modeling.lora import LoRAConfig, apply_lora
+from sam2.modeling.lora import LoRAConfig, apply_lora, apply_qv_lora_to_fused_qkv
 
 
 def uniform_prompt_indices(num_frames: int, k: int) -> list[int]:
@@ -201,13 +201,13 @@ def configure_prompt_number_trainables(
     for p in model.parameters():
         p.requires_grad = False
 
-    image_lora = apply_lora(
+    image_lora = apply_qv_lora_to_fused_qkv(
         model,
         LoRAConfig(
             r=lora_r,
             alpha=lora_alpha,
             dropout=lora_dropout,
-            target_modules=("q_proj", "v_proj"),
+            target_modules=("qkv",),
             target_prefixes=("image_encoder",),
             freeze_base_model=False,
         ),
