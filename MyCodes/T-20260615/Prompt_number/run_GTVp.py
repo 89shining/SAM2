@@ -97,6 +97,10 @@ def main():
     parser.add_argument("--gpu-id", type=str, default=None)
     parser.add_argument("--init-ckpt", type=Path, default=DEFAULT_INIT_CKPT)
     parser.add_argument("--model-cfg", type=str, default=DEFAULT_MODEL_CFG)
+    parser.add_argument("--train-models", type=str, default="4")
+    parser.add_argument("--test-models", type=str, default="2-4")
+    parser.add_argument("--test-ks", type=str, default="2-4")
+    parser.add_argument("--folds", type=str, default="0-4")
     parser.add_argument("--seed", type=int, default=20260616)
     parser.add_argument("--max-epochs", type=int, default=100)
     parser.add_argument("--patience", type=int, default=15)
@@ -116,6 +120,7 @@ def main():
     parser.add_argument("--lora-dropout", type=float, default=0.1)
     parser.add_argument("--bidirectional-train", action="store_true")
     parser.add_argument("--forward-backbone-per-frame", action="store_true")
+    parser.add_argument("--no-train", action="store_true")
     parser.add_argument("--no-test", action="store_true")
     parser.add_argument("--no-resume", action="store_true")
     parser.add_argument("--no-save-predictions", action="store_true")
@@ -123,35 +128,15 @@ def main():
 
     prepare_ctv_alias_dataset(GTVP_DATA_ROOT, GTVP_ALIAS_ROOT)
 
-    cmd = [
-        sys.executable,
-        CURRENT_DIR / "run.py",
-        "--single-data-root",
+    common_args = [
+        "--data-root",
         GTVP_ALIAS_ROOT,
         "--init-ckpt",
         args.init_ckpt,
         "--model-cfg",
         args.model_cfg,
-        "--models",
-        "2-4",
-        "--test-ks",
-        "2-4",
         "--seed",
         args.seed,
-        "--max-epochs",
-        args.max_epochs,
-        "--patience",
-        args.patience,
-        "--lr",
-        args.lr,
-        "--min-lr",
-        args.min_lr,
-        "--warmup-epochs",
-        args.warmup_epochs,
-        "--weight-decay",
-        args.weight_decay,
-        "--grad-clip-norm",
-        args.grad_clip_norm,
         "--input-size",
         args.input_size,
         "--window-center",
@@ -171,21 +156,55 @@ def main():
         "--lora-dropout",
         args.lora_dropout,
     ]
-    if args.gpu_id is not None:
-        cmd.extend(["--gpu-id", args.gpu_id])
-    if args.bidirectional_train:
-        cmd.append("--bidirectional-train")
-    if args.forward_backbone_per_frame:
-        cmd.append("--forward-backbone-per-frame")
-    if args.no_test:
-        cmd.append("--no-test")
-    if args.no_resume:
-        cmd.append("--no-resume")
-    if args.no_save_predictions:
-        cmd.append("--no-save-predictions")
 
-    run_cmd(cmd, gpu_id=None)
-    rename_outputs_to_gtvp(GTVP_DATA_ROOT.parent)
+    if not args.no_train:
+        train_cmd = [
+            sys.executable,
+            CURRENT_DIR / "train.py",
+            *common_args,
+            "--models",
+            args.train_models,
+            "--max-epochs",
+            args.max_epochs,
+            "--patience",
+            args.patience,
+            "--lr",
+            args.lr,
+            "--min-lr",
+            args.min_lr,
+            "--warmup-epochs",
+            args.warmup_epochs,
+            "--weight-decay",
+            args.weight_decay,
+            "--grad-clip-norm",
+            args.grad_clip_norm,
+        ]
+        if args.bidirectional_train:
+            train_cmd.append("--bidirectional-train")
+        if args.forward_backbone_per_frame:
+            train_cmd.append("--forward-backbone-per-frame")
+        if args.no_resume:
+            train_cmd.append("--no-resume")
+        run_cmd(train_cmd, gpu_id=args.gpu_id)
+
+    if not args.no_test:
+        test_cmd = [
+            sys.executable,
+            CURRENT_DIR / "test.py",
+            *common_args,
+            "--models",
+            args.test_models,
+            "--test-ks",
+            args.test_ks,
+            "--folds",
+            args.folds,
+        ]
+        if args.forward_backbone_per_frame:
+            test_cmd.append("--forward-backbone-per-frame")
+        if args.no_save_predictions:
+            test_cmd.append("--no-save-predictions")
+        run_cmd(test_cmd, gpu_id=args.gpu_id)
+        rename_outputs_to_gtvp(GTVP_DATA_ROOT.parent)
 
 
 if __name__ == "__main__":

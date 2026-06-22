@@ -75,11 +75,10 @@ class LoRAQKVLinear(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         base = self.base_layer(x)
         hidden = self.lora_A(self.dropout(x))
-        delta_q = self.lora_B_q(hidden)
-        delta_v = self.lora_B_v(hidden)
-        delta_k = torch.zeros_like(delta_q)
-        delta = torch.cat((delta_q, delta_k, delta_v), dim=-1)
-        return base + delta * self.scaling
+        out = base.clone()
+        out[..., : self.qkv_dim] += self.lora_B_q(hidden) * self.scaling
+        out[..., 2 * self.qkv_dim :] += self.lora_B_v(hidden) * self.scaling
+        return out
 
 
 @dataclass(frozen=True)
