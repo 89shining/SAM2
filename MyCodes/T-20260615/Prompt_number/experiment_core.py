@@ -60,7 +60,9 @@ def uniform_prompt_indices(num_frames: int, k: int) -> list[int]:
 
 
 def sample_train_prompt_indices(num_frames: int, max_prompts: int) -> list[int]:
-    hi = int(min(max_prompts, num_frames))
+    if num_frames <= 1:
+        return [0]
+    hi = int(min(max_prompts, num_frames - 1))
     lo = int(min(2, hi))
     k = random.randint(lo, hi)
     return uniform_prompt_indices(num_frames, k)
@@ -102,7 +104,7 @@ def unprompted_only_loss(
     _, unprompted = split_prompt_masks(logits_tohw.shape[0], prompt_frames, logits_tohw.device)
     if bool(unprompted.any()):
         return criterion(logits_tohw[unprompted], gt_masks_tohw[unprompted].float())
-    return criterion(logits_tohw, gt_masks_tohw.float())
+    return None
 
 
 def dice_3d_from_logits(

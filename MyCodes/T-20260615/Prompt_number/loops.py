@@ -75,6 +75,9 @@ def train_one_epoch(
                 )
             loss = unprompted_only_loss(outputs, batch.masks, prompt_frames, criterion)
 
+        if loss is None or not loss.requires_grad:
+            continue
+
         scaler.scale(loss).backward()
         if grad_clip_norm and grad_clip_norm > 0:
             scaler.unscale_(optimizer)
