@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Delete erode1_top3 test prompt files only."""
+"""Delete erode2/top3/min50/dilate2 prompt files under test patient folders."""
 
 from __future__ import annotations
 
@@ -10,15 +10,18 @@ from pathlib import Path
 DEFAULT_PROMPT_ROOT = Path(
     "/home/wusi/SAM2/MyTrain/SAM2data/Rectal/20260720_CTV/Prompt_mask"
 )
-TARGET_NAMES = {
-    "pos_erode1_top3.nii.gz",
-    "neg_erode1_top3.nii.gz",
-}
+TARGET_NAMES = (
+    "pos_erode2_top3_min50mm2_dilate2.nii.gz",
+    "neg_erode2_top3_min50mm2_dilate2.nii.gz",
+)
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Delete only pos_erode1_top3 and neg_erode1_top3 under test/p_*."
+        description=(
+            "Delete only the prompt files generated with erosion radius 2, "
+            "Top-K 3, minimum area 50 mm2, and dilation radius 2."
+        )
     )
     parser.add_argument("--prompt-root", type=Path, default=DEFAULT_PROMPT_ROOT)
     parser.add_argument(
@@ -46,7 +49,7 @@ def main() -> None:
 
     targets = sorted(set(targets))
     if not targets:
-        print("No pos_erode1_top3/neg_erode1_top3 files found. Nothing to delete.")
+        print("No erode2/top3/min50/dilate2 files found. Nothing to delete.")
         return
 
     action = "DELETE" if args.execute else "PREVIEW"
@@ -60,7 +63,7 @@ def main() -> None:
     for path in targets:
         path.unlink()
     print(
-        f"\nDeleted {len(targets)} erode1_top3 files. All other files were preserved."
+        f"\nDeleted {len(targets)} erode files. All other files were preserved."
     )
 
 
