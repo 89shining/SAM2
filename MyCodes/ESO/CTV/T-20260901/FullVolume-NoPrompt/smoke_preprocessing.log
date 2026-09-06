@@ -1,0 +1,160 @@
+{
+  "patient": "p_0",
+  "original_size": [
+    512,
+    512,
+    105
+  ],
+  "original_spacing": [
+    1.171875,
+    1.171875,
+    5.0
+  ],
+  "resampled_size": [
+    480,
+    480,
+    105
+  ],
+  "resampled_spacing": [
+    1.25,
+    1.25,
+    5.0
+  ],
+  "plans": [
+    {
+      "patient": "p_0",
+      "category": "internal",
+      "source_indices": [
+        62,
+        63,
+        64,
+        65,
+        66,
+        67,
+        68,
+        69
+      ],
+      "order": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7
+      ],
+      "direction": "forward",
+      "z_sup": 51,
+      "z_inf": 74
+    },
+    {
+      "patient": "p_0",
+      "category": "superior_crossing",
+      "source_indices": [
+        48,
+        49,
+        50,
+        51,
+        52,
+        53,
+        54,
+        55
+      ],
+      "order": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7
+      ],
+      "direction": "forward",
+      "z_sup": 51,
+      "z_inf": 74
+    },
+    {
+      "patient": "p_0",
+      "category": "inferior_crossing",
+      "source_indices": [
+        72,
+        73,
+        74,
+        75,
+        76,
+        77,
+        78,
+        79
+      ],
+      "order": [
+        7,
+        6,
+        5,
+        4,
+        3,
+        2,
+        1,
+        0
+      ],
+      "direction": "reverse",
+      "z_sup": 51,
+      "z_inf": 74
+    },
+    {
+      "patient": "p_0",
+      "category": "superior_negative",
+      "source_indices": [
+        38,
+        39,
+        40,
+        41,
+        42,
+        43,
+        44,
+        45
+      ],
+      "order": [
+        7,
+        6,
+        5,
+        4,
+        3,
+        2,
+        1,
+        0
+      ],
+      "direction": "reverse",
+      "z_sup": 51,
+      "z_inf": 74
+    },
+    {
+      "patient": "p_0",
+      "category": "inferior_negative",
+      "source_indices": [
+        76,
+        77,
+        78,
+        79,
+        80,
+        81,
+        82,
+        83
+      ],
+      "order": [
+        7,
+        6,
+        5,
+        4,
+        3,
+        2,
+        1,
+        0
+      ],
+      "direction": "reverse",
+      "z_sup": 51,
+      "z_inf": 74
+    }
+  ]
+}

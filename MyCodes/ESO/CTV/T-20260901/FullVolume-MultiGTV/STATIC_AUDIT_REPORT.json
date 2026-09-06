@@ -1,0 +1,44 @@
+{
+  "status": "STATIC_AUDIT_PASS",
+  "experiment": "Independent FullVolume-MultiCT-MultiGTV",
+  "independent_initialization": "original sam2.1_hiera_large.pt; no FullVolume-NoPrompt weight loading",
+  "controls": "same split, preprocessing, sampling, segmentation loss, lambda, no-SI full-volume inference and original-space evaluation as FullVolume-NoPrompt",
+  "multi_context": {
+    "CT": "physical z-1/z/z+1; replicate only at volume ends",
+    "GTV": "physical z-1/z/z+1 dense prompts; explicit zero masks retained",
+    "image_fusion": "concat + 1x1 Conv residual with zero-init alpha",
+    "gtv_fusion": "concat + 1x1 Conv dense prompt residual with zero-init beta"
+  },
+  "memory": "previous CTV uses native SAM2 memory only; prev_sam_mask_logits=None",
+  "object_score": "pred_obj_scores=True architecture preserved; segmentation -1024 hard gate disabled",
+  "trainable": {
+    "image_backbone": "frozen",
+    "image_qv_lora": "r4 alpha16 dropout0.1",
+    "prompt_encoder": "full",
+    "memory_encoder": "full",
+    "memory_attention": "full",
+    "mask_decoder": "full",
+    "MultiCT_fusion": "full",
+    "MultiGTV_fusion": "full"
+  },
+  "files_sha256": {
+    "config.py": "5c328213227f03e92fa62591d87c585ca51cff4b78c11073a088e4535c239660",
+    "data.py": "9223604febc7452f6af38ade9a6584945bb781a9f3cf6da09531fdd63b4afe5e",
+    "engine.py": "69f665f92bf84cb15f5a1978adfd21217ecdb9795b87da182a702febd29afaec",
+    "evaluate_test.py": "279743ddc508f69036771359304fbd2372eb33f9e058aadbb05d94e7bffb9ec8",
+    "fusion.py": "f946431dd911861abf528b4cda18d19ad2abd298b5268ea552f69f4a4c9edf79",
+    "metrics.py": "d9647252d428d289767ee6e18fd7cad4a8cc4dd4033fa5b4231d0bb4729fe0eb",
+    "model.py": "a0241102e35f09e79dc5132ec7ce9e863239a139af2c13c9199f47c0ca71cf11",
+    "run_fivefold.sh": "614a27cea4c8cfcd3026e7f2bd7db2516ae72cbd162203f5c0e53e955176b01f",
+    "run_full_pipeline.sh": "c8658a8f259f94fd215e97113caaedb15bbeb789e69dae9fd6def286de8b9317",
+    "run_lambda_search.sh": "9ca11897112fcd4d389c0bc2f17b632cf98e7ffe2d4fef0994cf38f68d91afd2",
+    "runtime_patch.py": "dcf9a35b24922109962c6175ff45d501417dc8e903c5105c8e42431635546baa",
+    "select_best_fold.py": "f912355d1403b89f72b0f9298651866e7dc17340fe73e448108abc976739c2be",
+    "select_best_lambda.py": "91609ea79a37eb9eea8bc61665e027d9866bfaca71f7a1870e2caea3cba1ef64",
+    "smoke_multigtv_data.py": "bb0f0bc6afd7a26a7420bd953f912f368587e666bd4e7c46b7a2328932503c87",
+    "smoke_resume_pipeline.py": "8b04e6bf61a0703e8b70c134cc97202656fe1719da946a153bc7b897318ad7ce",
+    "test.py": "1e76da5517c68986a028057e95435c373af100ab28efe2720ece1ee91f71c434",
+    "train.py": "0bb161b98e09751e992a0cc040a6e95979f2eaf44320a127ba1dbe33124ba413"
+  },
+  "lambda_protocol": "independent MultiGTV Fold 0 search over {0,0.01,0.05,0.10,0.20}; selected lambda fixed for MultiGTV folds 0-4"
+}

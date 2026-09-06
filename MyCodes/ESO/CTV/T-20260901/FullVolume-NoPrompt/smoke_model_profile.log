@@ -1,0 +1,10 @@
+{
+  "n_trainable_tensors": 414,
+  "n_trainable_numel": 11714212,
+  "has_lora": true,
+  "memory_encoder_trainable": true,
+  "memory_attention_trainable": true,
+  "mask_decoder_trainable": true,
+  "prompt_encoder_trainable": false,
+  "frozen_image_backbone_violation": false
+}

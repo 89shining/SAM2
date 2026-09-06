@@ -1,0 +1,4 @@
+from config import *
+from data import *
+import SimpleITK as sitk,json
+s=load_splits(SPLIT_PATH);paths={p.name:p for p in patient_dirs(DATA_ROOT,'train')};c=CTVGTVCase(paths[s['folds'][0]['train'][0]]);plans=sample_epoch_plans([c],1,SEED,WINDOW);p=plans[0];v,g=c.video_with_context(p['source_indices']);assert int(v.num_frames)==10 and g.shape==(10,1,1024,1024);assert c.restore_probability_to_original(c.ctv.astype('float32')).shape==sitk.GetArrayFromImage(c.original_ctv).shape;print(json.dumps({'patient':c.patient,'context_frames':int(v.num_frames),'prompt_shape':list(g.shape),'plan_categories':[x['category'] for x in plans]},indent=2))

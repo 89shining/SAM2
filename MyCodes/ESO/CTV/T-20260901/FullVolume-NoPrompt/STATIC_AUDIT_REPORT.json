@@ -1,0 +1,89 @@
+{
+  "status": "STATIC_AND_SMOKE_AUDIT_PASS",
+  "experiment": "Independent FullVolume-NoPrompt CTV",
+  "no_si_range": true,
+  "no_gtv": true,
+  "no_spatial_prompt": true,
+  "split_source": "shared_splits.json",
+  "preprocessing": {
+    "spacing_xyz": [
+      1.25,
+      1.25,
+      5.0
+    ],
+    "ct_interpolation": "linear then bilinear 1024x1024",
+    "mask_interpolation": "nearest then binary",
+    "hu_clip": [
+      -160,
+      240
+    ],
+    "normalization": "(HU+160)/400",
+    "channels": "CT 1 to 3"
+  },
+  "evaluation": {
+    "early_stopping": "original-space mean validation Dice3D every epoch",
+    "max_epochs": 100,
+    "patience": 10,
+    "restore_prediction": "continuous probability linearly resampled to original CTV geometry, then thresholded at 0.5",
+    "test_file_pattern": "EsoCTV_test_p_<0..24>.nii"
+  },
+  "trainable": {
+    "image_encoder_backbone": "frozen",
+    "image_encoder_lora": "trainable",
+    "prompt_encoder": "frozen",
+    "memory_encoder": "trainable",
+    "memory_attention": "trainable",
+    "mask_decoder": "trainable"
+  },
+  "smokes": {
+    "python_pycompile": "passed",
+    "real_case_preprocessing_geometry_roundtrip": "passed",
+    "fold0_window_feasibility": "passed",
+    "sam2_large_lora_trainable_profile": "passed",
+    "trainable_tensors": 660,
+    "trainable_numel": 14908132,
+    "probability_restore_original_geometry": "passed",
+    "resume_rng_and_pipeline_selection": "passed"
+  },
+  "files_sha256": {
+    "config.py": "10cce27df3c933126101ebea35c807e644f519ddfffacc3421c1fdcd53d6edeb",
+    "data.py": "1c7dec70cb8df1666b089e08be01062a46a90aa5e7a103ba07706ea1374fb2fc",
+    "engine.py": "c521e7b3dd7bb962fb8187348b57604e82f727d8709c05697108a0ad2cf91a5c",
+    "evaluate_test.py": "279743ddc508f69036771359304fbd2372eb33f9e058aadbb05d94e7bffb9ec8",
+    "metrics.py": "d9647252d428d289767ee6e18fd7cad4a8cc4dd4033fa5b4231d0bb4729fe0eb",
+    "model.py": "2df9438c8e58467bb715460b338dbfafc300359bcb1979bf6a6009130ebae6af",
+    "run_fivefold.sh": "174a8c1b7c96c4db09a9c733cb6bc46cd862918be2d0f082f1240652a6a64812",
+    "run_full_pipeline.sh": "96bb1ba177181d51f06f39de9212a5b355b77101bf5f8ffce5e611634596e66c",
+    "run_lambda_search.sh": "affc8d5a579981d365644e5d48ed28c4e0a03765be8cfd310dd5196d3a7eb86a",
+    "select_best_fold.py": "f912355d1403b89f72b0f9298651866e7dc17340fe73e448108abc976739c2be",
+    "select_best_lambda.py": "91609ea79a37eb9eea8bc61665e027d9866bfaca71f7a1870e2caea3cba1ef64",
+    "smoke_model_profile.py": "ff665cece47e1793f4b2a468a8cdfe07162e51300ee78d636208900e9129cc99",
+    "smoke_preprocessing.py": "16ad72ed85507299f773047f8c7fbed6401e76bf97b42a1cc03d1ae06a7338b8",
+    "smoke_resume_pipeline.py": "8b04e6bf61a0703e8b70c134cc97202656fe1719da946a153bc7b897318ad7ce",
+    "test.py": "e8713cde803e08a99887bcb42d654a412e8812de2b3545c09e44638dd2a69dc1",
+    "train.py": "cb1479131f1e49eab63aedb06a8ed8198da20a1c9ce4acee8f79b8a9bc8c8af9"
+  },
+  "ranking": "NR-E physical-z logit score with mean softplus(score_outside-score_inside), d=1..3; direction invariant",
+  "image_encoder_lora": {
+    "implementation": "sam2.modeling.lora.apply_qv_lora_to_fused_qkv",
+    "r": 4,
+    "alpha": 16,
+    "dropout": 0.1,
+    "target_prefix": "image_encoder",
+    "target_module": "fused qkv; Q/V only"
+  },
+  "probability_restoration": "SAM2 sigmoid probability -> bilinear resize to resampled matrix -> SimpleITK linear resample to original CTV geometry -> threshold 0.5",
+  "automation": {
+    "pipeline": "run_full_pipeline.sh",
+    "steps": [
+      "lambda search fold_0",
+      "automatic lambda selection",
+      "fivefold training",
+      "automatic best-fold selection",
+      "25-case test",
+      "independent evaluator"
+    ],
+    "resume": "last.pth restores model, optimizer, epoch, best Dice, bad epochs, provenance and Python/NumPy/PyTorch/CUDA RNG state",
+    "selection_rule": "lambda: highest original-space validation Dice3D, tie lower HD95; fold: highest validation Dice3D"
+  }
+}
