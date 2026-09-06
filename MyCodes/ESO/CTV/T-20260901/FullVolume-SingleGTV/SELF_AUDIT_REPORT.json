@@ -1,0 +1,34 @@
+{
+  "audit": "FullVolume-SingleGTV pre-training self audit",
+  "status": "PASS",
+  "old_exp3_information_flow": {
+    "current_gtv_dense_prompt": true,
+    "no_point_box_prompt": true,
+    "previous_ctv_via_native_memory_only": true,
+    "prev_sam_mask_logits": null,
+    "pred_obj_scores": true,
+    "segmentation_hard_gate_disabled": true
+  },
+  "formal_protocol_vs_old_exp3_intended_updates": {
+    "image_encoder": "frozen backbone with Q/V LoRA r=4 alpha=16 dropout=0.1",
+    "prompt_encoder": "trainable",
+    "memory_encoder": "trainable",
+    "memory_attention": "trainable",
+    "mask_decoder": "trainable",
+    "sampling": "five no-range 8-slice categories",
+    "loss": "Dice+BCE/BCE plus NR-E physical-z rank loss"
+  },
+  "matched_to_multigtv": [
+    "data root, shared five folds, preprocessing, 1024 input, original-space probability restoration",
+    "five category sampling and random forward/reverse propagation",
+    "optimizer, learning rate, epoch=100, patience=10, checkpoint resume",
+    "lambda grid [0,0.01,0.05,0.10,0.20] using fold 0 then fixed for five folds",
+    "midpoint bidirectional test and evaluator"
+  ],
+  "only_method_difference_from_multigtv": [
+    "SingleGTV uses exactly 8 target image frames and their 8 current GTV prompts",
+    "MultiGTV uses 10 physical image/prompt frames to supply z-1/z/z+1 context for each of 8 targets",
+    "SingleGTV has no MultiSliceImageFusion and no MultiSliceGTVPromptFusion"
+  ],
+  "lambda_provenance": "run_lambda_search.sh roots at FullVolume-SingleGTV and calls this directory train.py/build_singlegtv; no NoPrompt or MultiGTV checkpoint/code is used"
+}

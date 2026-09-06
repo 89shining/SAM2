@@ -1,0 +1,11 @@
+{
+  "experiment": "Independent FullVolume-SingleGTV",
+  "control_alignment": "FullVolume-MultiGTV",
+  "only_method_difference": "current-slice GTV dense prompt; no multi-CT or multi-GTV neighbour fusion",
+  "target_windows": "Five independent 8-slice windows per case per epoch: internal, superior crossing, inferior crossing, superior negative, inferior negative",
+  "rank_loss": "Same NR-E physical-z ranking, d=1..3, crossing windows only",
+  "runtime": "pred_obj_scores=True; hard segmentation gate disabled; prev_sam_mask_logits=None; previous CTV flows only via native memory",
+  "trainable": "Image Q/V LoRA; Prompt Encoder; Memory Encoder; Memory Attention; Mask Decoder",
+  "frozen": "Image Encoder backbone except Q/V LoRA",
+  "evaluation": "full-volume midpoint bidirectional inference; continuous probability restored with linear resampling to original geometry, then threshold 0.5"
+}
