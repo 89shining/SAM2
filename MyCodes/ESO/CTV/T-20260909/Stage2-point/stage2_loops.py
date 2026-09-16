@@ -1,4 +1,4 @@
-"""Patient-level Stage-2 point-correction train/validation loops."""
+"""Patient-level native-state Stage-2 train and validation loops."""
 from __future__ import annotations
 
 import random
@@ -10,7 +10,7 @@ import torch.nn.functional as F
 
 from point_clicker import CorrectionPoint, sample_correction_point
 from stage1_bridge import DiceBCELoss, positive_slice_indices, sample_train_prompt_indices
-from stage2_tracking import bidirectional_mixed_outputs, hard_prediction, stacked_logits
+from stage2_tracking import OfficialMultiFrameBidirectionalState, hard_prediction, stacked_logits
 
 
 def _video_id(batch) -> int:
@@ -18,43 +18,32 @@ def _video_id(batch) -> int:
 
 
 def _gt_volume_zyx(batch) -> torch.Tensor:
-    """Return the single CTV object as a canonical [Z,Y,X] tensor."""
     masks = batch.masks
     if masks.ndim != 4 or masks.shape[1] != 1:
-        raise ValueError(
-            f"Stage2 requires one object with masks [Z,1,Y,X], got {tuple(masks.shape)}"
-        )
+        raise ValueError(f"Stage2 requires one object with masks [Z,1,Y,X], got {tuple(masks.shape)}")
     return masks[:, 0]
 
 
+def _new_state(model, batch, prompt_frames, base_backbone=None, trace=None):
+    return OfficialMultiFrameBidirectionalState(
+        model, batch, prompt_frames, base_backbone, trace
+    )
+
+
 def _initial_outputs(model, batch, prompt_frames: Sequence[int], base_backbone=None, trace=None):
-    """Replay only the clinician-supplied initial mask prompts."""
-    placeholder_prior = torch.zeros(
-        (int(batch.num_frames), *batch.masks.shape[-2:]),
-        device=batch.masks.device,
-        dtype=torch.bool,
-    )
-    return bidirectional_mixed_outputs(
-        model, batch, prompt_frames, placeholder_prior, [], base_backbone, trace
-    )
+    """Build P0 after registering each initial GT mask exactly once."""
+    return _new_state(model, batch, prompt_frames, base_backbone, trace).outputs()
 
 
 def _hard_mask_initialization(
     model, batch, prompt_frames: Sequence[int], base_backbone=None, trace=None
 ) -> torch.Tensor:
-    """Current Stage-2 model's mask-guided P0, returned as [Z,Y,X] bool."""
-    with torch.inference_mode():
-        if base_backbone is None:
-            base_backbone = model.forward_image(batch.flat_img_batch)
-        outputs = _initial_outputs(model, batch, prompt_frames, base_backbone, trace)
-        return hard_prediction(outputs)
+    with torch.no_grad():
+        return hard_prediction(_initial_outputs(model, batch, prompt_frames, base_backbone, trace))
 
 
 def _terminal_loss(
-    criterion: DiceBCELoss,
-    outputs,
-    gt_zyx: torch.Tensor,
-    initial_mask_frames: Sequence[int],
+    criterion: DiceBCELoss, outputs, gt_zyx: torch.Tensor, initial_mask_frames: Sequence[int]
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     logits = stacked_logits(outputs)[:, 0]
     keep = torch.ones(logits.shape[0], dtype=torch.bool, device=logits.device)
@@ -94,169 +83,163 @@ def _point_row(point: CorrectionPoint, round_index: int, dice_before: float, dic
     }
 
 
+def _terminal_replay(model, batch, prompt_frames, clicks):
+    """Use only for T=0, where P0 itself is the differentiable terminal state."""
+    terminal = _new_state(model, batch, prompt_frames)
+    for click in clicks:
+        terminal.add_click(click)
+    return terminal.outputs()
+
+
+def terminal_transition_from_history(model, batch, prompt_frames, clicks):
+    """Differentiate only the final real click after rebuilding S(t-1).
+
+    For an early-perfect trajectory, there is no valid propagation-only
+    transition in the native multi-frame state.  Rebuild the state immediately
+    before the last actual click under ``no_grad`` and replay that click with
+    autograd instead of invoking the legacy memory-decoupled API.
+    """
+    if not clicks:
+        return _terminal_replay(model, batch, prompt_frames, [])
+    with torch.no_grad():
+        history_backbone = model.forward_image(batch.flat_img_batch)
+        history = _new_state(model, batch, prompt_frames, history_backbone)
+        for historical_click in clicks[:-1]:
+            history.add_click(historical_click)
+    terminal = history.detached_terminal_snapshot()
+    terminal.add_click(clicks[-1])
+    return terminal.outputs()
+
+
 def train_patient_episode(
-    model,
-    batch,
-    spacing_zyx: Sequence[float],
-    rng: random.Random,
-    min_prompt_gap: int = 2,
+    model, batch, spacing_zyx: Sequence[float], rng: random.Random, min_prompt_gap: int = 2
 ) -> tuple[torch.Tensor | None, dict]:
-    """Build a no-grad trajectory and return loss only for its terminal state."""
+    """Train T=0 fully; for T>=1 backpropagate only through terminal transition."""
     gt = _gt_volume_zyx(batch).bool()
     gt_numpy = gt.detach().cpu().numpy()
     prompt_frames = sample_train_prompt_indices(
         positive_slice_indices(gt), 1, 5, min_prompt_gap, rng
     )
     terminal_round = rng.randint(0, 5)
+    criterion = DiceBCELoss().to(gt.device)
     clicks: list[CorrectionPoint] = []
     logs: list[dict] = []
-    criterion = DiceBCELoss().to(gt.device)
 
     if terminal_round == 0:
-        # T=0 is a genuinely trainable initialization episode. Per-frame
-        # backbone evaluation preserves Image Encoder LoRA gradients without
-        # retaining a full-volume encoder graph.
-        initial_outputs = _initial_outputs(model, batch, prompt_frames)
-        loss, logits, loss_seg, loss_presence = _terminal_loss(
-            criterion, initial_outputs, gt, prompt_frames
-        )
-        terminal_hard = logits.detach().gt(0.0)
+        outputs = _terminal_replay(model, batch, prompt_frames, [])
+        loss, logits, loss_seg, loss_presence = _terminal_loss(criterion, outputs, gt, prompt_frames)
+        hard = hard_prediction(outputs)
         return loss, {
-            "initial_prompt_frames": list(map(int, prompt_frames)),
-            "sampled_T": 0, "effective_T": 0, "clicks": [],
-            "terminal_dice": _whole_volume_dice(terminal_hard, gt),
-            "loss_seg": float(loss_seg.detach()),
-            "loss_presence": float(loss_presence.detach()),
+            "initial_prompt_frames": list(map(int, prompt_frames)), "sampled_T": 0,
+            "effective_T": 0, "clicks": [], "terminal_dice": _whole_volume_dice(hard, gt),
+            "loss_seg": float(loss_seg.detach()), "loss_presence": float(loss_presence.detach()),
         }
 
-    # Cache one detached Stage-2 image encoding for all intermediate no-grad
-    # trajectory rounds. The terminal differentiable round uses per-frame
-    # backbone evaluation to avoid retaining a full-volume Image Encoder graph.
+    # Native trajectory state persists across all historical clicks under
+    # no_grad.  The final click is handled below from a detached S(t-1)
+    # snapshot, avoiding full BPTT across C1...C(t-1).
     with torch.no_grad():
         trajectory_backbone = model.forward_image(batch.flat_img_batch)
-    previous = _hard_mask_initialization(model, batch, prompt_frames, trajectory_backbone)
-    terminal_outputs = None
+        trajectory = _new_state(model, batch, prompt_frames, trajectory_backbone)
+        previous = hard_prediction(trajectory.outputs())
+
     for round_index in range(1, terminal_round + 1):
         click = sample_correction_point(
             gt_numpy, previous.detach().cpu().numpy(), spacing_zyx, "train", rng,
             exclude_slices=prompt_frames,
         )
         if click is None:
-            # Exact P(t-1)=GT: no fabricated click and no trainable terminal
-            # state exists. This is correctly a zero-update episode.
             break
         clicks.append(click)
         before = _whole_volume_dice(previous, gt)
         if round_index < terminal_round:
             with torch.no_grad():
-                intermediate = bidirectional_mixed_outputs(
-                    model, batch, prompt_frames, previous, clicks, trajectory_backbone
-                )
-                next_hard = hard_prediction(intermediate)
+                trajectory.add_click(click)
+                next_hard = hard_prediction(trajectory.outputs())
             logs.append(_point_row(click, round_index, before, _whole_volume_dice(next_hard, gt)))
-            if torch.equal(next_hard, gt):
-                # The no-grad trajectory reached an exact mask before sampled T.
-                # Re-evaluate this same state once with gradients, using the same
-                # prior and accumulated clicks, so the effective terminal state
-                # still has the protocol-defined full-volume terminal loss.
-                terminal_outputs = bidirectional_mixed_outputs(
-                    model, batch, prompt_frames, previous, clicks, base_backbone_out=None
-                )
-                loss, logits, loss_seg, loss_presence = _terminal_loss(
-                    criterion, terminal_outputs, gt, prompt_frames
-                )
-                terminal_hard = logits.detach().gt(0.0)
-                logs[-1]["dice_after"] = _whole_volume_dice(terminal_hard, gt)
+            previous = next_hard
+            if torch.equal(previous, gt):
+                # Do not invent a propagation-only terminal transition. Replay
+                # the final real click from the preceding detached native state.
+                outputs = terminal_transition_from_history(model, batch, prompt_frames, clicks)
+                loss, logits, loss_seg, loss_presence = _terminal_loss(criterion, outputs, gt, prompt_frames)
+                logs[-1]["dice_after"] = _whole_volume_dice(hard_prediction(outputs), gt)
                 return loss, {
                     "initial_prompt_frames": list(map(int, prompt_frames)),
                     "sampled_T": int(terminal_round), "effective_T": int(round_index),
-                    "clicks": logs, "terminal_dice": _whole_volume_dice(terminal_hard, gt),
-                    "loss_seg": float(loss_seg.detach()),
-                    "loss_presence": float(loss_presence.detach()),
+                    "clicks": logs, "terminal_dice": _whole_volume_dice(hard_prediction(outputs), gt),
+                    "loss_seg": float(loss_seg.detach()), "loss_presence": float(loss_presence.detach()),
                     "early_perfect": True,
                 }
-            previous = next_hard
             continue
-        terminal_outputs = bidirectional_mixed_outputs(
-            model, batch, prompt_frames, previous, clicks, base_backbone_out=None
-        )
-        loss, logits, loss_seg, loss_presence = _terminal_loss(
-            criterion, terminal_outputs, gt, prompt_frames
-        )
-        terminal_hard = logits.detach().gt(0.0)
-        logs.append(_point_row(click, round_index, before, _whole_volume_dice(terminal_hard, gt)))
+
+        # Truncated interaction BPTT: clone normal detached S(t-1), then make
+        # only Ct, its memory update, and the following propagation trainable.
+        terminal = trajectory.detached_terminal_snapshot()
+        terminal.add_click(click)
+        outputs = terminal.outputs()
+        loss, logits, loss_seg, loss_presence = _terminal_loss(criterion, outputs, gt, prompt_frames)
+        hard = hard_prediction(outputs)
+        logs.append(_point_row(click, round_index, before, _whole_volume_dice(hard, gt)))
         return loss, {
             "initial_prompt_frames": list(map(int, prompt_frames)),
-            "sampled_T": int(terminal_round), "effective_T": int(round_index),
-            "clicks": logs, "terminal_dice": _whole_volume_dice(terminal_hard, gt),
-            "loss_seg": float(loss_seg.detach()),
-            "loss_presence": float(loss_presence.detach()),
+            "sampled_T": int(terminal_round), "effective_T": int(round_index), "clicks": logs,
+            "terminal_dice": _whole_volume_dice(hard, gt),
+            "loss_seg": float(loss_seg.detach()), "loss_presence": float(loss_presence.detach()),
         }
+
     return None, {
         "initial_prompt_frames": list(map(int, prompt_frames)),
-        "sampled_T": int(terminal_round), "effective_T": len(clicks),
-        "clicks": logs, "terminal_dice": _whole_volume_dice(previous, gt),
+        "sampled_T": int(terminal_round), "effective_T": len(clicks), "clicks": logs,
+        "terminal_dice": _whole_volume_dice(previous, gt),
         "perfect_before_trainable_terminal": True,
     }
 
 
 @torch.no_grad()
 def validate_k3_t5(
-    model,
-    loader,
-    validation_plan: Mapping[str, Mapping],
-    spacing_by_patient: Mapping[int, Sequence[float]],
+    model, loader, validation_plan: Mapping[str, Mapping], spacing_by_patient: Mapping[int, Sequence[float]]
 ) -> tuple[float, list[dict], dict]:
-    """Fixed K=3, two placements, P0--P5 Dice and workflow mean."""
+    """Fixed K=3 native state transitions, P0 through P5."""
     model.eval()
-    patient_rows: list[dict] = []
+    rows: list[dict] = []
     for batch in loader:
         batch = batch.to(next(model.parameters()).device, non_blocking=True)
         patient = _video_id(batch)
-        record = validation_plan[str(patient)]
-        placements = record["placements"]["3"]
+        placements = validation_plan[str(patient)]["placements"]["3"]
         if len(placements) != 2:
-            raise ValueError(f"Patient {patient}: Stage2 validation requires exactly two K=3 placements")
-        placement_curves = []
+            raise ValueError(f"Patient {patient}: validation needs exactly two K=3 placements")
+        curves = []
         backbone = model.forward_image(batch.flat_img_batch)
+        gt = _gt_volume_zyx(batch)
+        gt_numpy = gt.detach().cpu().numpy()
         for placement in placements:
             prompts = [int(value) for value in placement["prompt_frame_ids"]]
-            previous = _hard_mask_initialization(model, batch, prompts, backbone)
-            clicks: list[CorrectionPoint] = []
-            curve = [_whole_volume_dice(previous, _gt_volume_zyx(batch))]
-            for _round in range(1, 6):
+            state = _new_state(model, batch, prompts, backbone)
+            previous = hard_prediction(state.outputs())
+            curve = [_whole_volume_dice(previous, gt)]
+            for _ in range(5):
                 click = sample_correction_point(
-                    _gt_volume_zyx(batch).detach().cpu().numpy(), previous.detach().cpu().numpy(),
-                    spacing_by_patient[patient], "validation",
-                    exclude_slices=prompts,
+                    gt_numpy, previous.detach().cpu().numpy(), spacing_by_patient[patient],
+                    "validation", exclude_slices=prompts,
                 )
-                if click is None:
-                    curve.append(curve[-1])
-                    continue
-                clicks.append(click)
-                outputs = bidirectional_mixed_outputs(
-                    model, batch, prompts, previous, clicks, backbone
-                )
-                previous = hard_prediction(outputs)
-                curve.append(_whole_volume_dice(previous, _gt_volume_zyx(batch)))
-            placement_curves.append(curve)
-        averaged = np.asarray(placement_curves, dtype=np.float64).mean(axis=0)
+                if click is not None:
+                    state.add_click(click)
+                    previous = hard_prediction(state.outputs())
+                curve.append(_whole_volume_dice(previous, gt))
+            curves.append(curve)
+        averaged = np.asarray(curves, dtype=np.float64).mean(axis=0)
         row = {"patient_id": patient}
         for t in range(6):
-            row[f"placement0_dice_p{t}"] = placement_curves[0][t]
-            row[f"placement1_dice_p{t}"] = placement_curves[1][t]
+            row[f"placement0_dice_p{t}"] = curves[0][t]
+            row[f"placement1_dice_p{t}"] = curves[1][t]
             row[f"dice_p{t}"] = float(averaged[t])
         row["workflow_score_p0_p5"] = float(averaged.mean())
         row["gain_p5_minus_p0"] = float(averaged[5] - averaged[0])
-        patient_rows.append(row)
-    mean_curve = {
-        f"D{t}": float(np.mean([row[f"dice_p{t}"] for row in patient_rows]))
-        for t in range(6)
-    }
-    score = float(np.mean([mean_curve[f"D{t}"] for t in range(6)]))
-    summary = {
-        **mean_curve,
-        "workflow_score_p0_p5": score,
+        rows.append(row)
+    mean_curve = {f"D{t}": float(np.mean([row[f"dice_p{t}"] for row in rows])) for t in range(6)}
+    score = float(np.mean(list(mean_curve.values())))
+    return score, rows, {
+        **mean_curve, "workflow_score_p0_p5": score,
         "gain_D5_minus_D0": mean_curve["D5"] - mean_curve["D0"],
     }
-    return score, patient_rows, summary

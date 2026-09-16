@@ -24,7 +24,7 @@ def _ensure_project_root_on_path():
     env_root = os.environ.get("SAM2_PROJECT_ROOT", "").strip()
     if env_root:
         candidates.insert(0, Path(env_root).resolve())
-    candidates.append(Path("/home/intern/ftp/wusi/SAM2"))
+    candidates.append(Path("/home/wusi/SAM2"))
 
     for root in candidates:
         if (root / "sam2").is_dir() and (root / "training").is_dir():

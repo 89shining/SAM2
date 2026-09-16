@@ -26,17 +26,27 @@ class CorrectionPoint:
 _CONN26 = np.ones((3, 3, 3), dtype=np.uint8)
 
 
-def _components(mask: np.ndarray) -> list[np.ndarray]:
+def _largest_labeled_component(
+    mask: np.ndarray, error_type: str,
+) -> tuple[tuple[int, tuple[int, int, int], str, int], np.ndarray] | None:
+    """Find the largest 26-connected component without materializing every mask."""
     labels, count = ndimage.label(mask.astype(bool), structure=_CONN26)
-    return [labels == index for index in range(1, int(count) + 1)]
-
-
-def _lexicographic_first(mask: np.ndarray) -> tuple[int, int, int]:
-    coords = np.argwhere(mask)
-    if len(coords) == 0:
-        raise ValueError("Expected at least one foreground voxel")
-    # np.argwhere is C-order / z,y,x lexicographically ordered.
-    return tuple(int(value) for value in coords[0])
+    if count == 0:
+        return None
+    sizes = np.bincount(labels.ravel(), minlength=int(count) + 1)
+    sizes[0] = 0
+    largest = int(sizes.max())
+    best: tuple[int, tuple[int, int, int], str, int] | None = None
+    # Only tied maxima require a full-volume equality mask to preserve the
+    # exact former lexicographic tie-break. Typical calls scan one component.
+    for index in np.flatnonzero(sizes == largest):
+        first = tuple(int(value) for value in np.argwhere(labels == index)[0])
+        candidate = (-largest, first, error_type, int(index))
+        if best is None or candidate < best:
+            best = candidate
+    if best is None:
+        return None
+    return best, labels
 
 
 def _largest_error_component(
@@ -51,7 +61,8 @@ def _largest_error_component(
     if gt.shape != pred.shape:
         raise ValueError(f"GT/prediction shape mismatch: {gt.shape} vs {pred.shape}")
     voxel_mm3 = float(np.prod(np.asarray(spacing_zyx, dtype=np.float64)))
-    candidates: list[tuple[int, tuple[int, int, int], str, np.ndarray]] = []
+    winner: tuple[int, tuple[int, int, int], str, int] | None = None
+    winning_labels: np.ndarray | None = None
     excluded = np.zeros(gt.shape[0], dtype=bool)
     for z in exclude_slices:
         z = int(z)
@@ -61,16 +72,19 @@ def _largest_error_component(
     for error_type, error in (("FN", gt & ~pred), ("FP", pred & ~gt)):
         error = error.copy()
         error[excluded] = False
-        for component in _components(error):
-            count = int(component.sum())
-            candidates.append((count, _lexicographic_first(component), error_type, component))
-    if not candidates:
+        found = _largest_labeled_component(error, error_type)
+        if found is None:
+            continue
+        candidate, labels = found
+        if winner is None or candidate < winner:
+            winner, winning_labels = candidate, labels
+    if winner is None or winning_labels is None:
         return None
     # Physical volume is count * identical patient voxel volume; count is exact.
     # Prefer FN before FP only when volume and location are exactly tied.
-    candidates.sort(key=lambda item: (-item[0], item[1], item[2]))
     _ = voxel_mm3  # Explicitly document physical-volume equivalence within patient.
-    return candidates[0][3], candidates[0][2]
+    _, _, error_type, label = winner
+    return winning_labels == label, error_type
 
 
 def sample_correction_point(
@@ -119,3 +133,4 @@ def sample_correction_point(
         component_voxels=count,
         component_mm3=float(count * np.prod(np.asarray(spacing_zyx, dtype=np.float64))),
     )
+

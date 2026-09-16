@@ -15,15 +15,18 @@ from stage1_bridge import (
     DEFAULT_DATA_ROOT, DEFAULT_INIT_CKPT, DEFAULT_MODEL_CFG, DEFAULT_SPLIT_PATH,
     RectalCTVVolumeDataset, build_model, make_or_load_splits,
 )
-from stage2_loops import _gt_volume_zyx, _hard_mask_initialization, _initial_outputs, _terminal_loss
-from stage2_tracking import bidirectional_mixed_outputs, hard_prediction, stacked_logits
+from stage2_loops import (
+    _gt_volume_zyx, _hard_mask_initialization, _initial_outputs, _terminal_loss,
+    terminal_transition_from_history,
+)
+from stage2_tracking import OfficialMultiFrameBidirectionalState, hard_prediction, stacked_logits
 from point_clicker import CorrectionPoint, sample_correction_point
 from stage1_bridge import DiceBCELoss
 from training.utils.data_utils import collate_fn
 
 
 STAGE1_RESULTS = Path(
-    "/home/intern/ftp/wusi/SAM2/MyTrain/SAM2data/Eso/20260909_CTV/"
+    "/home/wusi/SAM2/MyTrain/SAM2data/Eso/20260909_CTV/"
     "Stage1-mask/TrainResults"
 )
 
@@ -43,8 +46,18 @@ def _args():
     parser.add_argument("--init-ckpt", type=Path, default=DEFAULT_INIT_CKPT)
     parser.add_argument("--model-cfg", default=DEFAULT_MODEL_CFG)
     parser.add_argument("--device", default="cuda")
+    parser.add_argument(
+        "--budgets",
+        type=int,
+        nargs="+",
+        default=[0, 1, 3, 5],
+        help="Correction budgets to probe; use '--budgets 0 1' for the preflight micro-smoke.",
+    )
     parser.add_argument("--output", type=Path, default=Path("stage2_probe_report.json"))
-    return parser.parse_args()
+    args = parser.parse_args()
+    if any(budget < 0 or budget > 5 for budget in args.budgets):
+        parser.error("--budgets values must be within 0..5")
+    return args
 
 
 def _model_args(cli):
@@ -92,9 +105,9 @@ def _execute_budget(model, batch, prompts, spacing_zyx, budget: int) -> dict:
     else:
         with torch.no_grad():
             cached = model.forward_image(batch.flat_img_batch)
-        trace_start = len(trace)
-        previous = _hard_mask_initialization(model, batch, prompts, cached, trace)
-        for item in trace[trace_start:]:
+            trajectory = OfficialMultiFrameBidirectionalState(model, batch, prompts, cached, trace)
+            previous = hard_prediction(trajectory.outputs())
+        for item in trace:
             item["correction_round"] = 0
         for round_index in range(1, budget + 1):
             click = sample_correction_point(
@@ -107,17 +120,16 @@ def _execute_budget(model, batch, prompts, spacing_zyx, budget: int) -> dict:
             if round_index < budget:
                 with torch.no_grad():
                     trace_start = len(trace)
-                    outputs = bidirectional_mixed_outputs(
-                        model, batch, prompts, previous, clicks, cached, trace
-                    )
+                    trajectory.add_click(click)
+                    outputs = trajectory.outputs()
                     for item in trace[trace_start:]:
                         item["correction_round"] = round_index
                     previous = hard_prediction(outputs)
             else:
                 trace_start = len(trace)
-                outputs = bidirectional_mixed_outputs(
-                    model, batch, prompts, previous, clicks, None, trace
-                )
+                terminal = trajectory.detached_terminal_snapshot()
+                terminal.add_click(click)
+                outputs = terminal.outputs()
                 for item in trace[trace_start:]:
                     item["correction_round"] = round_index
                 loss, logits, loss_seg, loss_presence = _terminal_loss(criterion, outputs, gt, prompts)
@@ -131,17 +143,17 @@ def _execute_budget(model, batch, prompts, spacing_zyx, budget: int) -> dict:
                     f"Budget T={budget} reached an exact P0 before any correction; "
                     "this probe cannot demonstrate the required correction backward pass."
                 )
-            trace_start = len(trace)
-            outputs = bidirectional_mixed_outputs(
-                model, batch, prompts, previous, clicks, None, trace
-            )
-            for item in trace[trace_start:]:
-                item["correction_round"] = len(clicks)
+            outputs = terminal_transition_from_history(model, batch, prompts, clicks)
             loss, logits, loss_seg, loss_presence = _terminal_loss(criterion, outputs, gt, prompts)
     loss.backward()
-    trainable_with_grad = sum(
-        int(p.grad is not None) for p in model.parameters() if p.requires_grad
-    )
+    trainable_grads = [p.grad for p in model.parameters() if p.requires_grad and p.grad is not None]
+    trainable_with_grad = len(trainable_grads)
+    finite_grad_tensors = sum(int(torch.isfinite(grad).all()) for grad in trainable_grads)
+    nonzero_grad_tensors = sum(int(torch.any(grad != 0)) for grad in trainable_grads)
+    if not torch.isfinite(loss):
+        raise RuntimeError(f"Non-finite loss at T={budget}: {float(loss.detach())}")
+    if nonzero_grad_tensors == 0:
+        raise RuntimeError(f"No nonzero trainable gradient at T={budget}")
     contract_errors = []
     for item in trace:
         if item["is_initial_mask_frame"]:
@@ -150,24 +162,32 @@ def _execute_budget(model, batch, prompts, spacing_zyx, budget: int) -> dict:
                 and item["mask_inputs"] is True
                 and item["point_inputs"] is False
                 and item["prev_sam_mask_logits_shape"] is None
+                and item["is_init_cond_frame"] is True
+                and item["is_conditioning_output"] is True
             )
-            reason = "invalid initial-mask frame arguments"
+            reason = "invalid initial-mask frame state"
         elif item["is_point_frame"]:
             valid = (
                 item["gt_masks"] is False
                 and item["mask_inputs"] is False
                 and item["point_inputs"] is True
                 and item["prev_sam_mask_logits_shape"] is not None
+                and item["is_init_cond_frame"] is False
+                and item["is_conditioning_output"] is False
+                and item["bypasses_memory_attention"] is False
             )
-            reason = "invalid point-frame arguments"
+            reason = "invalid correction-frame state"
         else:
             valid = (
                 item["gt_masks"] is False
                 and item["mask_inputs"] is False
                 and item["point_inputs"] is False
                 and item["prev_sam_mask_logits_shape"] is None
+                and item["is_init_cond_frame"] is False
+                and item["is_conditioning_output"] is False
+                and item["bypasses_memory_attention"] is False
             )
-            reason = "invalid propagated-frame arguments"
+            reason = "invalid propagated-frame state"
         if not valid:
             contract_errors.append({"reason": reason, **item})
     prompt_set = set(map(int, prompts))
@@ -175,12 +195,12 @@ def _execute_budget(model, batch, prompts, spacing_zyx, budget: int) -> dict:
         if int(point.z) in prompt_set:
             contract_errors.append({"reason": "correction point on initial-mask slice", **point.__dict__})
     if contract_errors:
-        raise RuntimeError(f"Mixed interaction contract failed: {contract_errors[:2]}")
+        raise RuntimeError(f"Official multi-frame interaction contract failed: {contract_errors[:2]}")
     round_conditioning_frames = []
     for round_index in sorted({int(item["correction_round"]) for item in trace}):
         entries = [item for item in trace if int(item["correction_round"]) == round_index]
         directions = {}
-        for direction in ("forward", "reverse"):
+        for direction in ("canonical", "forward", "reverse"):
             directions[direction] = [
                 int(item["frame"]) for item in entries
                 if item["direction"] == direction and (item["mask_inputs"] or item["point_inputs"])
@@ -194,6 +214,8 @@ def _execute_budget(model, batch, prompts, spacing_zyx, budget: int) -> dict:
         "loss_presence": float(loss_presence.detach()),
         "logit_shape": list(logits.shape),
         "trainable_parameters_with_grad": trainable_with_grad,
+        "finite_gradient_tensors": finite_grad_tensors,
+        "nonzero_gradient_tensors": nonzero_grad_tensors,
         "mixed_interaction_contract": "PASS",
         "round_conditioning_frames": round_conditioning_frames,
         "trace": trace,
@@ -220,7 +242,7 @@ def main():
     model = _make_probe_model(cli, device)
     model.train()
     report = {"patient_id": patient, "prompt_frames": prompts, "spacing_zyx": _spacing(patient_dir), "budgets": []}
-    for budget in (0, 1, 3, 5):
+    for budget in cli.budgets:
         if device.type == "cuda":
             torch.cuda.reset_peak_memory_stats(device)
         with torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=device.type == "cuda"):
@@ -237,6 +259,8 @@ def main():
             "round_conditioning_frames": result.get("round_conditioning_frames", []),
             "loss": result.get("loss"),
             "trainable_parameters_with_grad": result.get("trainable_parameters_with_grad"),
+            "finite_gradient_tensors": result.get("finite_gradient_tensors"),
+            "nonzero_gradient_tensors": result.get("nonzero_gradient_tensors"),
             "peak_allocated_gib": result.get("peak_allocated_gib"),
             "peak_reserved_gib": result.get("peak_reserved_gib"),
             "mixed_interaction_contract": result.get("mixed_interaction_contract"),

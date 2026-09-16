@@ -81,6 +81,7 @@ def track_in_order(
     prompt_frames: Sequence[int],
     frame_order: Sequence[int],
     track_in_reverse: bool,
+    gt_masks_for_track_step: bool = True,
 ) -> list[dict]:
     prompt_frames = sorted(set(int(x) for x in prompt_frames))
     prompt_set = set(prompt_frames)
@@ -137,7 +138,10 @@ def track_in_order(
                 feat_sizes=feat_sizes,
                 point_inputs=point_inputs,
                 mask_inputs=mask_inputs,
-                gt_masks=backbone_out["gt_masks_per_frame"].get(stage_id, None),
+                # Evaluation must expose GT only through mask_inputs on the
+                # frozen conditioning slices, never through this auxiliary API.
+                gt_masks=(backbone_out["gt_masks_per_frame"].get(stage_id, None)
+                          if gt_masks_for_track_step else None),
                 frames_to_add_correction_pt=[],
                 output_dict=output_dict,
                 num_frames=num_frames,
@@ -170,6 +174,7 @@ def bidirectional_outputs(
     prompt_frames: Sequence[int],
     forward_backbone_per_frame: bool = False,
     base_backbone_out: dict | None = None,
+    gt_masks_for_track_step: bool = True,
 ) -> list[dict]:
     if base_backbone_out is None:
         base_backbone_out = precompute_backbone_out(core_model, batch, forward_backbone_per_frame)
@@ -181,6 +186,7 @@ def bidirectional_outputs(
         prompt_frames=prompt_frames,
         frame_order=list(range(num_frames)),
         track_in_reverse=False,
+        gt_masks_for_track_step=gt_masks_for_track_step,
     )
     outputs_backward = track_in_order(
         core_model=core_model,
@@ -189,6 +195,7 @@ def bidirectional_outputs(
         prompt_frames=prompt_frames,
         frame_order=list(range(num_frames - 1, -1, -1)),
         track_in_reverse=True,
+        gt_masks_for_track_step=gt_masks_for_track_step,
     )
     return fuse_bidirectional_outputs(outputs_forward, outputs_backward)
 

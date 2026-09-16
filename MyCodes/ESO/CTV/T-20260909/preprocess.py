@@ -14,10 +14,10 @@ import numpy as np
 import SimpleITK as sitk
 
 DEFAULT_RAW_DATA_ROOT = Path(
-    "/home/intern/ftp/wusi/SAM2/MyTrain/SAM2data/Eso/20260905_CTV/datanii"
+    "/home/wusi/SAM2/MyTrain/SAM2data/Eso/20260905_CTV/datanii"
 )
 DEFAULT_DATA_ROOT = Path(
-    "/home/intern/ftp/wusi/SAM2/MyTrain/SAM2data/Eso/20260909_CTV/PreprocessDataNii"
+    "/home/wusi/SAM2/MyTrain/SAM2data/Eso/20260909_CTV/PreprocessDataNii"
 )
 DEFAULT_TARGET_Z_SPACING = 5.0
 
@@ -158,7 +158,7 @@ def main() -> None:
     parser = argparse.ArgumentParser("Offline preprocessing for ESO CTV Stage-1")
     parser.add_argument("--source-root", type=Path, default=DEFAULT_RAW_DATA_ROOT)
     parser.add_argument("--output-root", type=Path, default=DEFAULT_DATA_ROOT)
-    parser.add_argument("--partition", default="train")
+    parser.add_argument("--partition", default="test")
     parser.add_argument("--target-z-spacing", type=float, default=DEFAULT_TARGET_Z_SPACING)
     parser.add_argument("--image-size", type=int, default=512)
     parser.add_argument("--window-center", type=float, default=40.0)

@@ -24,8 +24,8 @@ from stage2_loops import train_patient_episode, validate_k3_t5
 from training.utils.data_utils import collate_fn
 
 
-STAGE1_RESULTS = Path("/home/intern/ftp/wusi/SAM2/MyTrain/SAM2data/Eso/20260909_CTV/Stage1-mask/TrainResults")
-DEFAULT_OUTPUT_ROOT = Path("/home/intern/ftp/wusi/SAM2/MyTrain/SAM2data/Eso/20260909_CTV/Stage2-point/TrainResults")
+STAGE1_RESULTS = Path("/home/wusi/SAM2/MyTrain/SAM2data/Eso/20260909_CTV/Stage1-mask/TrainResults")
+DEFAULT_OUTPUT_ROOT = Path("/home/wusi/SAM2/MyTrain/SAM2data/Eso/20260909_CTV/Stage2-point/TrainResults")
 
 
 def collate_one(items):
@@ -174,7 +174,14 @@ def main():
         optimizer.load_state_dict(state["optimizer"]); scheduler.load_state_dict(state["scheduler"])
         start, best, best_epoch, patience = int(state["epoch"]) + 1, float(state["best_metric"]), int(state["best_epoch"]), int(state["patience_counter"])
 
-    print({"fold": args.fold, "stage1_ckpt": str(args.stage1_ckpt), "train_T": "U(0..5)", "validation": "K=3 x two placements, D0..D5; best=mean(D0..D5)", "lr": args.lr}, flush=True)
+    print({
+        "fold": args.fold,
+        "stage1_ckpt": str(args.stage1_ckpt),
+        "interaction_mode": "official_multiframe_noncond_correction_state",
+        "train_T": "U(0..5)",
+        "validation": "K=3 x two placements, D0..D5; best=mean(D0..D5)",
+        "lr": args.lr,
+    }, flush=True)
     for epoch in range(start, args.epochs + 1):
         model.train(); losses = []; loss_seg_values = []; loss_presence_values = []; terminal_dice = []
         for batch in train_loader:

@@ -205,6 +205,7 @@ def validate_fixed_plan(
                         prompt_frames,
                         forward_backbone_per_frame=False,
                         base_backbone_out=base_backbone_out,
+                        gt_masks_for_track_step=False,
                     )
                 case_un.append(
                     unprompted_slice_3d_dsc(outputs, batch.masks, prompt_frames)

@@ -54,12 +54,12 @@ from training.utils.data_utils import Frame, Object, VideoDatapoint
 from experiment_core import configure_prompt_number_trainables
 
 
-DEFAULT_RAW_DATA_ROOT = Path("/home/intern/ftp/wusi/SAM2/MyTrain/SAM2data/Eso/20260905_CTV/datanii")
-DEFAULT_DATA_ROOT = Path("/home/intern/ftp/wusi/SAM2/MyTrain/SAM2data/Eso/20260909_CTV/PreprocessDataNii")
-DEFAULT_OUTPUT_ROOT = Path("/home/intern/ftp/wusi/SAM2/MyTrain/SAM2data/Eso/20260909_CTV/Stage1-mask/TrainResults")
-DEFAULT_SPLIT_PATH = Path("/home/intern/ftp/wusi/SAM2/MyTrain/MyCodes/ESO/CTV/T-20260901/shared_splits.json")
+DEFAULT_RAW_DATA_ROOT = Path("/home/wusi/SAM2/MyTrain/SAM2data/Eso/20260905_CTV/datanii")
+DEFAULT_DATA_ROOT = Path("/home/wusi/SAM2/MyTrain/SAM2data/Eso/20260909_CTV/PreprocessDataNii")
+DEFAULT_OUTPUT_ROOT = Path("/home/wusi/SAM2/MyTrain/SAM2data/Eso/20260909_CTV/Stage1-mask/TrainResults")
+DEFAULT_SPLIT_PATH = Path("/home/wusi/SAM2/MyTrain/MyCodes/ESO/CTV/T-20260901/shared_splits.json")
 DEFAULT_MODEL_CFG = "configs/sam2.1/sam2.1_hiera_s.yaml"
-DEFAULT_INIT_CKPT = Path("/home/intern/ftp/wusi/SAM2/checkpoints/sam2.1_hiera_small.pt")
+DEFAULT_INIT_CKPT = Path("/home/wusi/SAM2/checkpoints/sam2.1_hiera_small.pt")
 DEFAULT_TARGET_Z_SPACING = 5.0
 
 
