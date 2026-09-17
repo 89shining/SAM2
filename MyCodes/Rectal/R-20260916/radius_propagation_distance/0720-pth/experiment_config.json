@@ -1,0 +1,50 @@
+{
+  "experiment_id": "R-20260916",
+  "purpose": "Independent POS and NEG physical disk-radius and physical propagation-gate ablation",
+  "source_data": "/home/wusi/SAM2/MyTrain/SAM2data/Rectal/R-20260720/Prompt_mask",
+  "output_root": "/home/wusi/SAM2/MyTrain/SAM2data/Rectal/R-20260916",
+  "code_root": "/home/wusi/SAM2/MyTrain/MyCodes/Rectal/R-20260916",
+  "split": {"train": 99, "validation": 11, "test": 36},
+  "split_file": "/home/wusi/SAM2/MyTrain/SAM2data/Rectal/R-20260720/TrainResults/POS/split.json",
+  "branches": ["pos", "neg"],
+  "train_radii_mm": [2, 4, 6, 8, 10, 12, 14, 16, 18, 20],
+  "gate_mm": [0, 5, 10, 15, 20, 30, 40, 60, "infinity"],
+  "initialization": {
+    "pos": "/home/wusi/SAM2/MyTrain/SAM2data/Rectal/R-20260720/TrainResults/POS/checkpoints/best.pth",
+    "neg": "/home/wusi/SAM2/MyTrain/SAM2data/Rectal/R-20260720/TrainResults/NEG/checkpoints/best.pth",
+    "base": "/home/wusi/SAM2/checkpoints/sam2.1_hiera_small.pt",
+    "forbidden": ["20260814 checkpoints", "20260824 checkpoints", "cross-radius warm start"]
+  },
+  "prompt": {
+    "pos_error": "GT & ~nnUNet",
+    "neg_error": "nnUNet & ~GT",
+    "per_slice": "erode 2px -> 8-connected components -> top 3 -> area >=50mm2 using true XY spacing -> dilate 2px",
+    "center": "argmax physical XY Euclidean distance transform in each postprocessed component",
+    "disk": "physical XY disk; only image-FOV clipping, never error/component/GT/nnUNet/body clipping"
+  },
+  "training": {
+    "input_size": 512,
+    "window_slices": 9,
+    "patient_prompt_fraction": "Uniform(0.30,0.70), patient-level, resampled per epoch",
+    "validation_prompt_fraction": 0.5,
+    "epochs_max": 60,
+    "early_stopping_patience": 10,
+    "early_stop_start_epoch": 5,
+    "warmup_epochs": 5,
+    "lora": "r=4 alpha=16 dropout=0.1",
+    "loss": "unchanged 0720 Dice+BCE",
+    "thresholds": {"pos": 0.5, "neg_retention": 0.5},
+    "training_propagation": "random single direction per patient update (forward or backward, approximately 50/50)",
+    "evaluation_propagation": "forward/backward probability average",
+    "forbidden": ["distance gate during probability inference", "03 postprocessing", "test-set model selection"]
+  },
+  "selection": {
+    "order": "best checkpoint epoch -> best gate per training radius -> best training radius",
+    "checkpoint": "fixed 11-case validation correction Dice only; no gate sweep by epoch",
+    "gate": "Dice >= Dmax-0.001, then lowest mean HD95, then smaller m",
+    "radius": "Dice >= Dmax-0.001, then lowest mean HD95, then smaller r",
+    "pos_neg": "fully independent; no combined branch analysis in this stage",
+    "test_protocol": "After validation locks m*(r) for every r and r*, test every prelocked (r,m*(r)) for the sensitivity curve; test never changes r*. Save NIfTI only for each r's prelocked m*(r)."
+  },
+  "gpu_scheduler": {"min_free_mib": 16000, "max_utilization_percent": 20, "max_parallel": 8}
+}

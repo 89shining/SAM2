@@ -1,0 +1,36 @@
+{
+  "status": "complete",
+  "scope": "training_geometry_only",
+  "training_cases": 99,
+  "validation_cases_read": 0,
+  "test_cases_read": 0,
+  "split_json": "/home/intern/ftp/wusi/SAM2/MyTrain/SAM2data/Rectal/20260720_CTV/PositiveCorrection/TrainResults/split.json",
+  "split_md5": "2933e8e1ef887ecc62606ffa3c5a3eb0",
+  "input_size": 512,
+  "radii_mm": [
+    2.0,
+    4.0,
+    6.0,
+    8.0,
+    10.0,
+    12.0,
+    14.0,
+    16.0,
+    18.0,
+    20.0
+  ],
+  "prompt_fraction": 0.5,
+  "selection": "SI-uniform, round-half-up count",
+  "preprocessing": "erode2px -> 8-connected -> top3 -> area>=50mm2 -> dilate2px",
+  "disk": "physical XY disk, not clipped to error component, clipped only by image FOV",
+  "distance": "nearest prompt voxel Euclidean distance using resized (sz,sy,sx) physical coordinates",
+  "z_spacing_mm": {
+    "min": 5.0,
+    "median": 5.0,
+    "max": 5.0,
+    "unique_counts": {
+      "5.0": 99
+    }
+  },
+  "candidate_grid_locked": false
+}

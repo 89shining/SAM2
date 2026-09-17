@@ -1,0 +1,135 @@
+[01/99] p_0
+[02/99] p_1
+[03/99] p_2
+[04/99] p_3
+[05/99] p_4
+[06/99] p_5
+[07/99] p_6
+[08/99] p_7
+[09/99] p_8
+[10/99] p_9
+[11/99] p_10
+[12/99] p_12
+[13/99] p_13
+[14/99] p_14
+[15/99] p_15
+[16/99] p_16
+[17/99] p_17
+[18/99] p_19
+[19/99] p_20
+[20/99] p_21
+[21/99] p_22
+[22/99] p_23
+[23/99] p_24
+[24/99] p_25
+[25/99] p_27
+[26/99] p_28
+[27/99] p_29
+[28/99] p_30
+[29/99] p_32
+[30/99] p_33
+[31/99] p_34
+[32/99] p_35
+[33/99] p_37
+[34/99] p_38
+[35/99] p_39
+[36/99] p_40
+[37/99] p_41
+[38/99] p_42
+[39/99] p_43
+[40/99] p_44
+[41/99] p_45
+[42/99] p_46
+[43/99] p_47
+[44/99] p_48
+[45/99] p_50
+[46/99] p_51
+[47/99] p_53
+[48/99] p_54
+[49/99] p_55
+[50/99] p_56
+[51/99] p_57
+[52/99] p_58
+[53/99] p_59
+[54/99] p_60
+[55/99] p_61
+[56/99] p_62
+[57/99] p_63
+[58/99] p_64
+[59/99] p_65
+[60/99] p_66
+[61/99] p_67
+[62/99] p_68
+[63/99] p_69
+[64/99] p_70
+[65/99] p_71
+[66/99] p_72
+[67/99] p_73
+[68/99] p_74
+[69/99] p_75
+[70/99] p_76
+[71/99] p_77
+[72/99] p_79
+[73/99] p_80
+[74/99] p_81
+[75/99] p_82
+[76/99] p_83
+[77/99] p_84
+[78/99] p_85
+[79/99] p_86
+[80/99] p_87
+[81/99] p_88
+[82/99] p_89
+[83/99] p_91
+[84/99] p_92
+[85/99] p_93
+[86/99] p_94
+[87/99] p_95
+[88/99] p_96
+[89/99] p_97
+[90/99] p_98
+[91/99] p_99
+[92/99] p_100
+[93/99] p_101
+[94/99] p_102
+[95/99] p_103
+[96/99] p_105
+[97/99] p_106
+[98/99] p_107
+[99/99] p_109
+{
+  "status": "complete",
+  "scope": "training_geometry_only",
+  "training_cases": 99,
+  "validation_cases_read": 0,
+  "test_cases_read": 0,
+  "split_json": "/home/intern/ftp/wusi/SAM2/MyTrain/SAM2data/Rectal/20260720_CTV/PositiveCorrection/TrainResults/split.json",
+  "split_md5": "2933e8e1ef887ecc62606ffa3c5a3eb0",
+  "input_size": 512,
+  "radii_mm": [
+    2.0,
+    4.0,
+    6.0,
+    8.0,
+    10.0,
+    12.0,
+    14.0,
+    16.0,
+    18.0,
+    20.0
+  ],
+  "prompt_fraction": 0.5,
+  "selection": "SI-uniform, round-half-up count",
+  "preprocessing": "erode2px -> 8-connected -> top3 -> area>=50mm2 -> dilate2px",
+  "disk": "physical XY disk, not clipped to error component, clipped only by image FOV",
+  "distance": "nearest prompt voxel Euclidean distance using resized (sz,sy,sx) physical coordinates",
+  "z_spacing_mm": {
+    "min": 5.0,
+    "median": 5.0,
+    "max": 5.0,
+    "unique_counts": {
+      "5.0": 99
+    }
+  },
+  "candidate_grid_locked": false
+}

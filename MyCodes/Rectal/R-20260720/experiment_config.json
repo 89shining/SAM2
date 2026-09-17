@@ -1,0 +1,23 @@
+{
+  "experiment_id": "R-20260720",
+  "task": "Rectal CTV full-mask POS/NEG correction baseline",
+  "split": {"train": 99, "validation": 11, "test": 36},
+  "input_size": 512,
+  "seed": 20260724,
+  "pos_error": "GT & ~nnUNet",
+  "neg_error": "nnUNet & ~GT",
+  "prompt_type": "complete postprocessed component mask; no disk",
+  "prompt_preprocessing": {
+    "dimensionality": "2D per axial slice",
+    "erosion_radius_pixels": 2,
+    "connectivity": 8,
+    "top_components_per_slice": 3,
+    "minimum_component_area_mm2": 50,
+    "dilation_radius_pixels": 2
+  },
+  "pos_prompt_name": "pos_erode2_top3_min50mm2_dilate2.nii.gz",
+  "neg_prompt_name": "neg_erode2_top3_min50mm2_dilate2.nii.gz",
+  "base_checkpoint": "/home/wusi/SAM2/checkpoints/sam2.1_hiera_small.pt",
+  "original_input_root": "/home/wusi/SAM2/MyTrain/SAM2data/Rectal/20260720_CTV/Prompt_mask",
+  "clean_results_root": "/home/wusi/SAM2/MyTrain/SAM2data/Rectal/R-20260720"
+}
