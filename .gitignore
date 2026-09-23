@@ -1,4 +1,11 @@
 .vscode/
+
+# Local 3D Slicer / PyInstaller artifacts and private model weights.
+MyCodes/Rectal/R-20260720/Interactive_develop/3dSlicer_develop/checkpoint/
+MyCodes/Rectal/R-20260916/Interactive_develop/3dSlicer_develop/checkpoint/
+MyCodes/T-20260615/Interactive_develop/3dSlicer_develop/SAM2_Mask.spec
+MyCodes/T-20260615/Interactive_develop/3dSlicer_develop/build/
+MyCodes/T-20260615/Interactive_develop/3dSlicer_develop/dist/
 .DS_Store
 __pycache__/
 *-checkpoint.ipynb
