@@ -20,6 +20,23 @@ from training.utils.data_utils import collate_fn
 TRAIN = Path('/home/wusi/SAM2/MyTrain/SAM2data/Eso/20260909_CTV/Stage1-mask/TrainResults')
 PLAN = Path('/home/wusi/nnInteractive/MyResults/Eso/20260909_CTV/Stage1-lasso/TestResults/prompt_plans/stage1_prompt_plan.json')
 
+def load_evaluation_weights(model, saved):
+    weights = saved.get('model')
+    if weights is None:
+        raise KeyError('checkpoint does not contain a model state')
+    if isinstance(saved.get('args'), dict) and 'fold' in saved['args']:
+        model.load_state_dict(weights, strict=True)
+        return
+    merged = model.state_dict()
+    for name, value in merged.items():
+        if name in weights:
+            merged[name] = weights[name]
+        elif '.base_layer.' in name and name.replace('.base_layer.', '.') in weights:
+            merged[name] = weights[name.replace('.base_layer.', '.')]
+        elif 'lora_' in name:
+            merged[name] = torch.zeros_like(value)
+    model.load_state_dict(merged, strict=True)
+
 def args_():
  p=argparse.ArgumentParser(); p.add_argument('--data-root',type=Path,default=DEFAULT_DATA_ROOT/'train'); p.add_argument('--split-path',type=Path,default=DEFAULT_SPLIT_PATH); p.add_argument('--model-cfg',default=DEFAULT_MODEL_CFG); p.add_argument('--init-ckpt',type=Path,default=DEFAULT_INIT_CKPT); p.add_argument('--train-results',type=Path,default=TRAIN); p.add_argument('--checkpoint',type=Path,help='Explicit checkpoint override, e.g. a Stage2 fold0 best.pth.'); p.add_argument('--plan',type=Path,default=PLAN); p.add_argument('--output-dir',type=Path); p.add_argument('--fold',type=int,default=0); p.add_argument('--external-test',action='store_true',help='Evaluate every case in --data-root with the requested checkpoint; do not apply a training split.'); p.add_argument('--allow-legacy-fold0-checkpoint',action='store_true'); p.add_argument('--device',default='cuda'); p.add_argument('--amp',action=argparse.BooleanOptionalAction,default=True); p.add_argument('--save-predictions',action='store_true'); p.add_argument('--lora-r',type=int,default=4); p.add_argument('--lora-alpha',type=int,default=16); p.add_argument('--lora-dropout',type=float,default=.1); p.add_argument('--input-size',type=int,default=512); p.add_argument('--image-encoder-activation-checkpointing',action=argparse.BooleanOptionalAction,default=True); return p.parse_args()
 
@@ -78,7 +95,7 @@ def main():
    if int(saved['args']['fold'])!=fold: raise RuntimeError(f'checkpoint fold mismatch: {ckpt}')
    for name in ('model_cfg','input_size','lora_r','lora_alpha','lora_dropout'):
     if name not in saved['args'] or str(saved['args'][name])!=str(getattr(a,name)): raise RuntimeError(f'checkpoint/config mismatch for {name}: {ckpt}')
-  model,_=build_model(a.model_cfg,a.init_ckpt,device,a); model.load_state_dict(saved['model'],strict=True); model.eval()
+  model,_=build_model(a.model_cfg,a.init_ckpt,device,a); load_evaluation_weights(model,saved); model.eval()
   for (group_fold,key),tasks in sorted(grouped.items()):
    if group_fold!=fold: continue
    for pid,prompts in sorted(tasks):
