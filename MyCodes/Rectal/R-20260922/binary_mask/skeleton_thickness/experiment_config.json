@@ -1,0 +1,28 @@
+{
+  "experiment": "R-20260922 binary-mask skeleton-thickness sensitivity analysis",
+  "data_root": "/home/wusi/SAM2/MyTrain/SAM2data/Rectal/R-20260720/Prompt_mask",
+  "initial_checkpoint": "/home/wusi/SAM2/checkpoints/sam2.1_hiera_small.pt",
+  "input_size": 512,
+  "split": "reuse R-20260916 99/11/36 split byte-for-byte",
+  "branches": ["pos", "neg"],
+  "thickness_mm": [0, 2, 4, 6, 8, 10, 12],
+  "propagation_gate_mm": [0, 5, 10, 15, 20, 30, 40, 60, "infinity"],
+  "training": {
+    "axial_prompt_fraction": [0.3, 0.7],
+    "skeleton_segment_fraction": [0.3, 0.7],
+    "segment_mode": "random_contiguous_geodesic_segment",
+    "direction": "random_single_direction",
+    "window_slices": 9
+  },
+  "validation": {
+    "axial_prompt_fraction": 0.5,
+    "axial_selection": "deterministic_uniform",
+    "skeleton_segment_fraction": 0.5,
+    "segment_mode": "deterministic_central_geodesic_segment",
+    "direction": "bidirectional_probability_mean"
+  },
+  "test_prompt_fractions": [0, 0.25, 0.5, 0.75, 1.0],
+  "selection_order": "epoch -> m_star(thickness) -> thickness_star",
+  "thresholds": {"pos": 0.5, "neg_retention": 0.5},
+  "propagation_gt_masks": null
+}

@@ -8,7 +8,7 @@ from skimage.morphology import skeletonize
 # =========================
 # 1. 修改这里
 # =========================
-ROOT_DIR = Path(r"D:\WUSI\Prompt_mask\train")
+ROOT_DIR = Path(r"/home/wusi/SAM2/MyTrain/SAM2data/Rectal/R-20260720/Prompt_mask/test")
 
 POS_NAME = "pos_erode2_top3_min50mm2_dilate2.nii.gz"
 NEG_NAME = "neg_erode2_top3_min50mm2_dilate2.nii.gz"

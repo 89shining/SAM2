@@ -1,0 +1,53 @@
+{
+  "experiment": "R-20260922 Gaussian-map skeleton sigma sensitivity",
+  "initial_checkpoint": "/home/wusi/SAM2/checkpoints/sam2.1_hiera_small.pt",
+  "input_size": 512,
+  "split": "exact R-20260916 99/11/36 split",
+  "branches": [
+    "pos",
+    "neg"
+  ],
+  "sigma_mm": [
+    1,
+    2,
+    3,
+    4
+  ],
+  "truncation": "3*sigma mm",
+  "training": {
+    "segment_fraction": [
+      0.3,
+      0.7
+    ],
+    "axial_prompt_fraction": [
+      0.3,
+      0.7
+    ],
+    "direction": "random single",
+    "window_slices": 9
+  },
+  "validation": {
+    "segment_fraction": 0.5,
+    "axial_prompt_fraction": 0.5,
+    "direction": "bidirectional mean"
+  },
+  "test_axial_prompt_fraction": [
+    0,
+    0.25,
+    0.5,
+    0.75,
+    1
+  ],
+  "gate_mm": [
+    0,
+    5,
+    10,
+    15,
+    20,
+    30,
+    40,
+    60,
+    "infinity"
+  ],
+  "selection": "epoch -> m*(sigma) -> sigma*"
+}
